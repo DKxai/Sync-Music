@@ -5,3 +5,4 @@ apscheduler==3.11.0
 cryptography==44.0.3
 PyJWT==2.10.1
 ytmusicapi>=1.11,<2
+python-dotenv==1.0.1

@@ -129,3 +129,7 @@ python3 -m pytest -q tests
 - Monitor with `docker stats music-sync-hub`, `du -sh data`, `docker compose logs --tail 50 api`.
 - **Sync Now** triggers `POST /v1/sync/all` or `POST /v1/sync/{provider}` (HTTP 202), status at `GET /v1/sync/status`, per-job status at `/v1/sync/jobs/{job_id}`. Manual/scheduled polling share a single queue and duplicate jobs are coalesced.
 - Running this version does **not** upload changes to Spotify/YTM/Apple; it reads, snapshots, matches exact ISRC, and detects changes. `DELETE_MODE=auto` is future policy only.
+
+## Botkeep Cloud (native Python, no Docker)
+
+Use `python main.py` as Botkeep start command. The launcher reads Botkeep's `SERVER_PORT` and managed `.env`, creates a single Uvicorn worker, and uses `data/` for SQLite by default. See [Botkeep deployment guide](docs/BOTKEEP.md). Docker Compose is for separate Docker-capable servers only.
