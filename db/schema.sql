@@ -112,3 +112,19 @@ CREATE TABLE IF NOT EXISTS conflicts (
 );
 INSERT OR IGNORE INTO accounts(provider) VALUES ('spotify'),('ytmusic'),('apple');
 INSERT OR IGNORE INTO settings(key,value) VALUES('baseline_approved','false');
+
+CREATE TABLE IF NOT EXISTS reviewed_links (
+  source_provider TEXT NOT NULL REFERENCES accounts(provider),
+  target_provider TEXT NOT NULL REFERENCES accounts(provider),
+  entity_kind TEXT NOT NULL CHECK(entity_kind IN ('track','artist')),
+  source_id TEXT NOT NULL,
+  target_id TEXT NOT NULL,
+  PRIMARY KEY(source_provider,target_provider,entity_kind,source_id),
+  UNIQUE(source_provider,target_provider,entity_kind,target_id),
+  FOREIGN KEY(source_provider,entity_kind,source_id)
+    REFERENCES provider_mappings(provider,entity_kind,remote_id),
+  FOREIGN KEY(target_provider,entity_kind,target_id)
+    REFERENCES provider_mappings(provider,entity_kind,remote_id),
+  CHECK(source_provider<>target_provider)
+);
+CREATE INDEX IF NOT EXISTS operation_status_idx ON sync_operations(status, id);

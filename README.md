@@ -1,6 +1,6 @@
 # Music Sync Hub (self-hosted / single user)
 
-Version **0.2.0 infrastructure + manual Sync Now dashboard + read-only import starter**. Supports Spotify, YouTube Music, and Apple Music snapshot ingestion, poll scheduling (5/10/10 minutes), SQLite schema, Spotify OAuth PKCE login, audit API and safe removal *detection*. **Does not yet write/add/remove tracks in third-party accounts.** `DELETE_MODE=auto` is a target policy; `WRITE_ENABLED=false` is deliberately enforced at this stage. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Version **0.3.0** supports scheduled snapshots, manual Sync Now, Spotify OAuth, Google device authorization for YouTube Music, and MusicKit user authorization. The reviewed additions writer can add mapped liked tracks and followed artists between Spotify and YouTube Music. Its default is off. See [Botkeep setup](docs/BOTKEEP.md) for current setup and release scope.
 
 ## 1. Requirements
 
@@ -85,7 +85,7 @@ curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8787/v1/events
 curl -s -H "X-API-Key: $KEY" http://127.0.0.1:8787/v1/conflicts
 ```
 
-**Important:** "baseline approved" means change detection, NOT a complete two-way sync or remote delete authorization. Initial import has no cross-service writes. The canonical `music_items` table is a staging index; cross-platform no-ISRC matches still require further matching logic.
+**Important:** "baseline approved" means change detection and planning of reviewed additions. Remote deletion is still detection-only. Initial import has no cross-service writes. The canonical `music_items` table is a staging index; cross-platform no-ISRC matches still require further matching logic.
 
 ## 7. Backup / rollback
 
@@ -128,7 +128,7 @@ python3 -m pytest -q tests
 - `docker system prune` can delete resources used by other projects: do not run it on a shared server. Use `docker image prune` only after reviewing image usage.
 - Monitor with `docker stats music-sync-hub`, `du -sh data`, `docker compose logs --tail 50 api`.
 - **Sync Now** triggers `POST /v1/sync/all` or `POST /v1/sync/{provider}` (HTTP 202), status at `GET /v1/sync/status`, per-job status at `/v1/sync/jobs/{job_id}`. Manual/scheduled polling share a single queue and duplicate jobs are coalesced.
-- Running this version does **not** upload changes to Spotify/YTM/Apple; it reads, snapshots, matches exact ISRC, and detects changes. `DELETE_MODE=auto` is future policy only.
+- With `WRITE_ENABLED=false` this runs in read-only mode. With writes enabled, only reviewed Spotify–YouTube Music additions are executed. `DELETE_MODE=auto` still controls removal detection only.
 
 ## Botkeep Cloud (native Python, no Docker)
 

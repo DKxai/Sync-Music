@@ -10,6 +10,7 @@ import httpx
 from .base import Item, NotConfigured
 from ..config import settings
 from ..db import connect
+from ..provider_tokens import invalidate_account
 
 API = 'https://api.spotify.com/v1'
 AUTH = 'https://accounts.spotify.com'
@@ -28,18 +29,19 @@ def _load_tokens():
     return json.loads(_cipher().decrypt(row['payload_ciphertext']))
 
 
-def _save_tokens(tokens: dict):
+def _save_tokens(tokens: dict, *, reconnect: bool = False):
     existing = None
     try:
         existing = _load_tokens()
     except NotConfigured:
         pass
-    if existing and not tokens.get('refresh_token'):
+    if existing and not reconnect and not tokens.get('refresh_token'):
         tokens['refresh_token'] = existing.get('refresh_token')
     token = _cipher().encrypt(json.dumps(tokens).encode())
     with connect() as con:
         con.execute('INSERT INTO encrypted_tokens(provider,payload_ciphertext) VALUES(?,?) ON CONFLICT(provider) DO UPDATE SET payload_ciphertext=excluded.payload_ciphertext,updated_at=datetime("now")', ('spotify',token))
-        con.execute('UPDATE accounts SET status="connected",last_error=NULL,updated_at=datetime("now") WHERE provider="spotify"')
+        if reconnect:
+            invalidate_account(con, 'spotify')
 
 
 def auth_url():
@@ -52,7 +54,10 @@ def auth_url():
     with connect() as con:
         con.execute('DELETE FROM oauth_states WHERE expires_at < datetime("now")')
         con.execute('INSERT INTO oauth_states(state,verifier_ciphertext,expires_at) VALUES(?,?,?)', (state,_cipher().encrypt(verifier.encode()),expires_at))
-    params = dict(response_type='code',client_id=settings.spotify_client_id,redirect_uri=settings.spotify_redirect_uri,code_challenge_method='S256',code_challenge=challenge,scope=SCOPES,state=state)
+    scope = SCOPES
+    if settings.write_enabled:
+        scope += ' user-library-modify user-follow-modify'
+    params = dict(response_type='code',client_id=settings.spotify_client_id,redirect_uri=settings.spotify_redirect_uri,code_challenge_method='S256',code_challenge=challenge,scope=scope,state=state)
     return f'{AUTH}/authorize?{urlencode(params)}'
 
 
@@ -62,18 +67,25 @@ async def redeem(code: str, state: str):
         row = con.execute('SELECT verifier_ciphertext FROM oauth_states WHERE state=? AND used_at IS NULL AND expires_at > datetime("now")', (state,)).fetchone()
         if not row:
             raise ValueError('Invalid or expired OAuth state')
-        con.execute('UPDATE oauth_states SET used_at=datetime("now") WHERE state=? AND used_at IS NULL', (state,))
+        consumed = con.execute('UPDATE oauth_states SET used_at=datetime("now") WHERE state=? AND used_at IS NULL', (state,))
+        if not consumed.rowcount:
+            raise ValueError('Invalid or expired OAuth state')
     verifier = _cipher().decrypt(row['verifier_ciphertext']).decode()
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(f'{AUTH}/api/token', data={'grant_type':'authorization_code','code':code,'redirect_uri':settings.spotify_redirect_uri,'client_id':settings.spotify_client_id,'code_verifier':verifier})
         r.raise_for_status()
         data = r.json()
     data['expires_at'] = (datetime.now(timezone.utc) + timedelta(seconds=int(data['expires_in'])-60)).timestamp()
-    _save_tokens(data)
+    if not data.get('refresh_token'):
+        raise ValueError('Spotify did not issue a refresh token')
+    data['client_id'] = settings.spotify_client_id
+    _save_tokens(data, reconnect=True)
 
 
 async def access_token():
     tokens = _load_tokens()
+    if tokens.get('client_id', settings.spotify_client_id) != settings.spotify_client_id:
+        raise NotConfigured('Spotify Client ID changed. Reconnect Spotify.')
     if tokens.get('expires_at',0) > datetime.now(timezone.utc).timestamp():
         return tokens['access_token']
     if not tokens.get('refresh_token'):
@@ -83,6 +95,7 @@ async def access_token():
         r.raise_for_status()
         data = r.json()
     data['expires_at'] = (datetime.now(timezone.utc) + timedelta(seconds=int(data['expires_in'])-60)).timestamp()
+    data['client_id'] = settings.spotify_client_id
     _save_tokens(data)
     return data['access_token']
 
@@ -140,3 +153,26 @@ async def fetch():
                 occurrences[t["id"]]=occurrences.get(t["id"],0)+1
                 out[scope].append(Item(scope, f"{t['id']}#{occurrences[t['id']]}",t.get('name') or '',artist=', '.join(x['name'] for x in t.get('artists',[]) if x.get('name')), album=(t.get('album') or {}).get('name'),duration_ms=t.get('duration_ms'),isrc=(t.get('external_ids') or {}).get('isrc'),raw={'track_id':t['id'],'position':pos}))
         return out
+
+
+
+async def contains(scope: str, remote_id: str) -> bool:
+    kind = {'liked': 'track', 'followed_artist': 'artist'}[scope]
+    headers = {'Authorization': f'Bearer {await access_token()}'}
+    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
+        response = await client.get(f'{API}/me/library/contains',
+                                    params={'uris': f'spotify:{kind}:{remote_id}'})
+        response.raise_for_status()
+        found = response.json()
+    if not isinstance(found, list) or len(found) != 1 or not isinstance(found[0], bool):
+        raise ValueError('Spotify library check returned an unexpected response')
+    return found[0]
+
+
+async def add_to_library(scope: str, remote_id: str) -> None:
+    kind = {'liked': 'track', 'followed_artist': 'artist'}[scope]
+    headers = {'Authorization': f'Bearer {await access_token()}'}
+    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
+        response = await client.put(f'{API}/me/library',
+                                    params={'uris': f'spotify:{kind}:{remote_id}'})
+        response.raise_for_status()

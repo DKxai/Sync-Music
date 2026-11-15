@@ -2,11 +2,14 @@ import asyncio
 from datetime import datetime, timezone
 import json
 from uuid import uuid4
+from httpx import HTTPStatusError
 
 from ..config import settings
 from ..connectors import spotify, ytmusic, apple
-from ..db import connect, get_setting
+from ..connectors.base import NotConfigured
+from ..db import connect
 from .safety import deletion_is_safe
+from .review import plan_add
 
 FETCHERS={'spotify':spotify.fetch,'ytmusic':ytmusic.fetch,'apple':apple.fetch}
 POLL_LOCK=asyncio.Lock()
@@ -29,10 +32,14 @@ def _canonical(con,provider,item):
 
 def _event(con,provider,scope,remote_id,kind,details):
     key=f'{provider}|{scope}|{remote_id}|{kind}|{datetime.now(timezone.utc).isoformat()}'
-    con.execute('INSERT INTO sync_events(event_key,provider,scope,remote_id,kind,details_json) VALUES(?,?,?,?,?,?)', (key,provider,scope,remote_id,kind,json.dumps(details,ensure_ascii=False)))
+    event = con.execute(
+        'INSERT INTO sync_events(event_key,provider,scope,remote_id,kind,details_json) VALUES(?,?,?,?,?,?)',
+        (key, provider, scope, remote_id, kind, json.dumps(details, ensure_ascii=False)),
+    )
+    if kind == 'added':
+        plan_add(con, event.lastrowid, provider, scope, remote_id)
 
 def persist(provider: str, scopes: dict):
-    baseline = get_setting('baseline_approved') == 'true'
     if not scopes or not isinstance(scopes,dict):
         raise ValueError('Provider returned no complete scope data; refusing snapshot')
     for scope,items in scopes.items():
@@ -42,6 +49,7 @@ def persist(provider: str, scopes: dict):
     with connect() as con:
         run=con.execute('INSERT INTO snapshot_runs(provider,status) VALUES(?,?)',(provider,'running')).lastrowid
         # Single transaction: either ALL scopes commit or NONE do.
+        baseline = con.execute("SELECT value FROM settings WHERE key='baseline_approved'").fetchone()[0] == 'true'
         for scope,items in scopes.items():
             current={i.remote_id:i for i in items}
             old=con.execute('SELECT remote_id,present,missing_streak,payload_json FROM source_states WHERE provider=? AND scope=?',(provider,scope)).fetchall()
@@ -75,7 +83,7 @@ def persist(provider: str, scopes: dict):
                         con.execute('UPDATE source_states SET missing_streak=? WHERE provider=? AND scope=? AND remote_id=?',(streak,provider,scope,remote_id))
         con.execute('UPDATE snapshot_runs SET status="complete",completed_at=datetime("now"),scope_counts_json=? WHERE id=?',(json.dumps({k:len(v) for k,v in scopes.items()}),run))
         con.execute('UPDATE accounts SET status="connected",last_success_at=datetime("now"),last_error=NULL,updated_at=datetime("now") WHERE provider=?',(provider,))
-    return {'provider':provider,'scopes':{k:len(v) for k,v in scopes.items()},'baseline_approved':baseline,'remote_writes':'disabled'}
+    return {'provider':provider,'scopes':{k:len(v) for k,v in scopes.items()},'baseline_approved':baseline,'remote_writes':'enabled_for_reviewed_additions' if settings.write_enabled else 'disabled'}
 
 async def poll(provider: str):
     if provider not in FETCHERS:raise ValueError('Unknown provider')
@@ -86,8 +94,13 @@ async def poll(provider: str):
             return persist(provider,scopes)
         except Exception as exc:
             # No partial snapshot is committed on error.
-            message=f'{type(exc).__name__}: {str(exc)[:500]}'
+            if isinstance(exc, NotConfigured):
+                message = str(exc)
+            elif isinstance(exc, HTTPStatusError):
+                message = f'Provider returned HTTP {exc.response.status_code}'
+            else:
+                message = f'Provider import failed ({type(exc).__name__})'
             with connect() as con:
                 con.execute('INSERT INTO snapshot_runs(provider,status,error,completed_at) VALUES(?,"failed",?,datetime("now"))',(provider,message))
                 con.execute('UPDATE accounts SET status="error",last_error=?,updated_at=datetime("now") WHERE provider=?',(message,provider))
-            return {'provider':provider,'error':message,'remote_writes':'disabled'}
+            return {'provider':provider,'error':message,'remote_writes':'enabled_for_reviewed_additions' if settings.write_enabled else 'disabled'}

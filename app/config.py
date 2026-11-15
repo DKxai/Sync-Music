@@ -17,11 +17,14 @@ class Settings:
     write_enabled: bool = os.getenv('WRITE_ENABLED', 'false').lower() == 'true'
     spotify_client_id: str = os.getenv('SPOTIFY_CLIENT_ID', '')
     spotify_redirect_uri: str = os.getenv('SPOTIFY_REDIRECT_URI', '')
+    ytm_client_id: str = os.getenv('YTM_CLIENT_ID', '')
+    ytm_client_secret: str = os.getenv('YTM_CLIENT_SECRET', '')
     ytm_auth_path: Path = Path(os.getenv('YTM_AUTH_PATH', '/run/private/ytmusic_browser.json'))
     apple_key_path: Path = Path(os.getenv('APPLE_KEY_PATH', '/run/private/apple_music_key.p8'))
     apple_user_token_path: Path = Path(os.getenv('APPLE_USER_TOKEN_PATH', '/run/private/apple_user_token.txt'))
     apple_team_id: str = os.getenv('APPLE_TEAM_ID', '')
     apple_key_id: str = os.getenv('APPLE_KEY_ID', '')
+    apple_web_origin: str = os.getenv('APPLE_WEB_ORIGIN', '').rstrip('/')
     apple_storefront: str = os.getenv('APPLE_STOREFRONT', 'vn')
 
 settings = Settings()

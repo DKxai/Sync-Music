@@ -2,7 +2,7 @@
 
 ## Scope, invariants and actual status
 
-This 0.1.0 release is a **read-only ingestion, audit, and infrastructure starter**, NOT a complete cross-service synchronizer. It DOES implement Spotify PKCE login, authenticated read adapters for Spotify/YT Music/Apple Music, durable SQLite snapshots, event detection, safe deletion guards, API and scheduled polling. It DOES NOT yet implement external add/remove/reorder/follow writes, match review UI or automatic replay. `WRITE_ENABLED=true` fails fast. `DELETE_MODE=auto` controls event detection policy only until a tested writer is implemented. Never represent these detected events as applied external operations.
+The current release imports snapshots and supports reviewed cross-platform additions for Spotify and YouTube Music liked tracks and followed artists. Only exact, operator-approved provider ID pairs can be queued. The single worker checks source and target membership against both providers and records success after read-back. Writes are disabled by default. Apple Music snapshot import, removal detection and quarantining are available. Playlist mutation, remote removals and undo are still planned.
 
 - Authority: the union of all three completed initial snapshots, once manually approved.
 - No deletion inference before baseline approval.
@@ -19,8 +19,8 @@ This 0.1.0 release is a **read-only ingestion, audit, and infrastructure starter
 2. Manually POST `/v1/sync/spotify`, `/v1/sync/ytmusic`, `/v1/sync/apple` and audit the returned counts.
 3. Back up `music.db` and inspect the `source_states` table.
 4. POST `/v1/baseline/approve` only after three complete initial imports.
-5. Scheduled polls detect additions/removals and quarantine unsafe drops. Remote writes remain disabled at this starter stage.
-6. Next implementation milestone: explicit reviewed mappings, per-platform capability matrix, outgoing op generation, idempotent write executor, post-write verification, echo suppression, retry and recovery.
+5. Scheduled polls detect additions/removals and quarantine unsafe drops. Scope-matched additions with an approved pair enter the audit queue. The runtime applies them only with `WRITE_ENABLED=true`.
+6. The next milestone covers remote removals, catalog searches for new items, playlist pairing and mutation, and undo.
 
 ## Scopes and semantics
 
@@ -87,14 +87,14 @@ Even after cross-service writers are built, require: baseline approved, a review
 | POST | `/v1/baseline/approve` | enable change detection | implemented |
 | POST | `/v1/auth/spotify/start` | issue PKCE auth URL | implemented |
 | GET | `/v1/auth/spotify/callback` | Spotify OAuth callback | implemented |
-| GET | `/v1/matches/pending` | candidate review | planned |
-| POST | `/v1/matches/{id}/approve` | approve high confidence match | planned |
+| GET | `/v1/matches/candidates` | candidate review by exact source ID | implemented |
+| POST | `/v1/matches/approve` | approve a one-to-one ID pair | implemented |
 | POST | `/v1/sync/preview` | preview incoming/outgoing diff | planned |
-| POST | `/v1/operations/execute` | apply verified outgoing writes | planned |
+| GET | `/v1/operations` | inspect durable planned and completed additions | implemented |
 | POST | `/v1/operations/{id}/undo` | safe rollback of supported operations | planned |
-| POST | `/v1/auth/apple/complete` | MusicKit authorized token | planned |
+| POST | `/v1/auth/apple/complete` | verify token and consume one-time authorization state | implemented |
 
-All implemented `/v1` routes except Spotify's callback require `X-API-Key`. Do not expose them publicly even with an API key alone. Rate-limit on reverse proxy if one is used.
+Administrative routes require `X-API-Key`. Provider authorization callback routes use short-lived one-time state. Do not expose them publicly even with an API key alone. Rate-limit on reverse proxy if one is used.
 
 ## Operations to implement after baseline (per-platform capabilities)
 

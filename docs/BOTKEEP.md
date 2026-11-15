@@ -1,10 +1,10 @@
 # Deploy to Botkeep Cloud (native Python runtime)
 
-Music Sync Hub is a self-hosted **read-only import/snapshot and Sync Now** starter. Remote writes and deletions are **not implemented** in this revision. Keep `WRITE_ENABLED=false` even when `DELETE_MODE=auto` is configured.
+Music Sync Hub runs scheduled imports and manual Sync Now in one Python worker. The default is `WRITE_ENABLED=false`. The optional writer supports reviewed Spotify–YouTube Music additions. `DELETE_MODE=auto` still controls removal detection only.
 
 ## Botkeep setup
 
-1. Sign in at https://botkeep.cloud/app and create an **Application > Python** workload (Python 3.12 if offered).
+1. Sign in at https://botkeep.cloud/app and create an **Application > Python** workload (Python 3.11 or 3.12).
 2. Select **GitHub**, repository `https://github.com/DKxai/Sync-Music`, branch `main`, project root `/`. Choose `requirements.txt` as dependency manifest.
 3. Start command: **`python main.py`**. This does not require Docker, docker-compose or PostgreSQL. It serves FastAPI on `0.0.0.0:$SERVER_PORT` as Botkeep requires.
 4. Suggested first allocation: **512 MB RAM, 50% CPU, 1 GB storage** if your account permits; monitor the first full import. A large music library can temporarily exceed 512 MB; do not assume zero OOM risk.
@@ -71,3 +71,9 @@ If the Botkeep runtime gives no persistent writable workspace or cannot upload p
 - Full-library fetching may still cause RAM spikes. If encountered, move to paginated streaming fetches; do not increase polling/concurrency.
 
 Source references: https://botkeep.cloud/docs/github and https://botkeep.cloud/docs/hosting.
+
+## Provider authorization and reviewed additions
+
+- For YouTube Music device authorization, enable the YouTube Data API in your Google Cloud project, create a **TVs and Limited Input devices** OAuth client, and set `YTM_CLIENT_ID` and `YTM_CLIENT_SECRET`. Restart the service. In the dashboard, choose **Kết nối YouTube Music**, open Google's verification page and enter the shown code. The browser-file configuration remains available.
+- For Apple Music web authorization, set `APPLE_WEB_ORIGIN` to the dashboard's HTTPS origin (without a path), supply `APPLE_TEAM_ID` and `APPLE_KEY_ID`, and place the MusicKit signing key at `private/apple_music_key.p8`. Restart and choose **Kết nối Apple Music** in the dashboard. The server verifies library access and stores the user token encrypted.
+- The sandbox default is `WRITE_ENABLED=false`. The writer implemented in this release handles **new, reviewed additions** of liked/saved songs and followed/subscribed artists between Spotify and YouTube Music. Approve the imported baseline and each exact ID pair from the dashboard. Spotify requires a new authorization after enabling the writer. Apple Music continues to import snapshots. Remote removals, playlist mutation and undo are outside this release.

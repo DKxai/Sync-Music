@@ -8,14 +8,19 @@ from uuid import uuid4
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
+import httpx
 
 from .config import settings, validate
-from .db import init_db, connect, get_setting, set_setting, prune_history
-from .connectors import spotify
+from .db import init_db, connect, get_setting, prune_history
+from . import apple_authorization
+from .connectors import apple, google_oauth, spotify
 from .connectors.base import NotConfigured
 from .dashboard import HTML
-from .sync.engine import poll
+from .provider_tokens import has_token
+from .sync.engine import POLL_LOCK, poll
+from .sync import review, writer
 
 PROVIDERS = ('spotify', 'ytmusic', 'apple')
 scheduler = AsyncIOScheduler(timezone='UTC')
@@ -67,21 +72,14 @@ async def scheduled_poll(provider: str):
 
 def provider_ready(provider: str) -> bool:
     if provider == 'ytmusic':
-        return settings.ytm_auth_path.is_file()
+        return settings.ytm_auth_path.is_file() or (google_oauth.configured() and has_token('ytmusic'))
     if provider == 'apple':
-        return bool(settings.apple_team_id and settings.apple_key_id
-                    and settings.apple_key_path.is_file()
-                    and settings.apple_user_token_path.is_file())
-    if not settings.spotify_client_id or not settings.spotify_redirect_uri:
-        return False
-    with connect() as con:
-        return con.execute("SELECT 1 FROM encrypted_tokens WHERE provider='spotify'").fetchone() is not None
+        return apple.developer_configured() and (settings.apple_user_token_path.is_file() or has_token('apple'))
+    return bool(settings.spotify_client_id and settings.spotify_redirect_uri and has_token('spotify'))
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate()
-    if settings.write_enabled:
-        raise RuntimeError('Remote writes have NOT been implemented. Keep WRITE_ENABLED=false.')
     init_db()
     for provider, minutes in [('spotify', settings.spotify_minutes),
                               ('ytmusic', settings.ytm_minutes),
@@ -90,6 +88,9 @@ async def lifespan(app: FastAPI):
                           id=provider, coalesce=True, max_instances=1, misfire_grace_time=60)
     scheduler.add_job(prune_history, 'cron', hour=3, minute=25, id='maintenance',
                       coalesce=True, max_instances=1)
+    if settings.write_enabled:
+        scheduler.add_job(execute_pending, 'interval', minutes=1, id='sync_writer',
+                          coalesce=True, max_instances=1, misfire_grace_time=60)
     scheduler.start()
     try:
         yield
@@ -100,7 +101,7 @@ async def lifespan(app: FastAPI):
         if _tasks:
             await asyncio.gather(*_tasks, return_exceptions=True)
 
-app = FastAPI(title='Music Sync Hub', version='0.2.0', lifespan=lifespan,
+app = FastAPI(title='Music Sync Hub', version='0.3.0', lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url=None)
 
 def admin(x_api_key: str | None = Header(default=None)):
@@ -113,7 +114,7 @@ def dashboard():
 
 @app.get('/health')
 def health():
-    return {'ok': True, 'service': 'music-sync-hub', 'stage': 'read-only-import'}
+    return {'ok': True, 'service': 'music-sync-hub', 'stage': 'reviewed-additions' if settings.write_enabled else 'read-only-import'}
 
 @app.get('/v1/config', dependencies=[Depends(admin)])
 def config():
@@ -122,9 +123,11 @@ def config():
             'delete_mode': settings.delete_mode, 'confirm_polls': settings.delete_confirm_polls,
             'max_delete_percent': settings.max_delete_percent,
             'max_delete_absolute': settings.max_delete_absolute,
-            'write_enabled': False, 'baseline_approved': get_setting('baseline_approved') == 'true',
+            'write_enabled': settings.write_enabled, 'baseline_approved': get_setting('baseline_approved') == 'true',
             'provider_ready': {provider: provider_ready(provider) for provider in PROVIDERS},
             'spotify_redirect_uri': settings.spotify_redirect_uri,
+            'ytmusic_oauth_configured': google_oauth.configured(),
+            'apple_oauth_configured': apple_authorization.configured(),
             'spotify_oauth_configured': bool(settings.spotify_client_id and settings.spotify_redirect_uri)}
 
 @app.get('/v1/accounts', dependencies=[Depends(admin)])
@@ -168,11 +171,12 @@ async def sync_now(provider: Literal['spotify', 'ytmusic', 'apple']):
 @app.post('/v1/baseline/approve', dependencies=[Depends(admin)])
 def approve_baseline():
     with connect() as con:
+        con.execute('BEGIN IMMEDIATE')
         providers = [r['provider'] for r in con.execute('SELECT provider FROM accounts WHERE status="connected" AND last_success_at IS NOT NULL')]
-    if set(providers) != set(PROVIDERS):
-        raise HTTPException(409, detail=f'Complete snapshots needed for all services; ready: {providers}')
-    set_setting('baseline_approved', 'true')
-    return {'approved': True, 'remote_writes_enabled': False}
+        if set(providers) != set(PROVIDERS):
+            raise HTTPException(409, detail=f'Complete snapshots needed for all services; ready: {providers}')
+        con.execute("UPDATE settings SET value='true', updated_at=datetime('now') WHERE key='baseline_approved'")
+    return {'approved': True, 'remote_writes_enabled': settings.write_enabled}
 
 @app.post('/v1/auth/spotify/start', dependencies=[Depends(admin)])
 def spotify_start():
@@ -183,10 +187,11 @@ def spotify_start():
 
 @app.get('/v1/auth/spotify/callback', response_class=HTMLResponse)
 async def spotify_callback(code: str | None = None, state: str | None = None, error: str | None = None):
-    if error or not code or not state:
+    if error or not code or not state or state.startswith('apple-'):
         raise HTTPException(400, 'Spotify authorization denied or missing parameters')
     try:
-        await spotify.redeem(code, state)
+        async with POLL_LOCK:
+            await spotify.redeem(code, state)
     except ValueError:
         raise HTTPException(400, 'Invalid or expired OAuth state')
     except Exception:
@@ -198,3 +203,105 @@ async def spotify_callback(code: str | None = None, state: str | None = None, er
         '<a href="/">Về dashboard</a></html>',
         headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'},
     )
+
+
+AUTH_HEADERS = {'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'}
+
+
+class GooglePoll(BaseModel):
+    handle: str = Field(min_length=16, max_length=80)
+
+
+class AppleGrant(BaseModel):
+    state: str = Field(min_length=16, max_length=80)
+    user_token: str = Field(min_length=16, max_length=8192)
+
+
+@app.post('/v1/auth/ytmusic/start', dependencies=[Depends(admin)])
+async def ytmusic_start():
+    try:
+        result = await google_oauth.start()
+    except NotConfigured as exc:
+        raise HTTPException(409, detail=str(exc))
+    except (httpx.HTTPError, ValueError, KeyError):
+        raise HTTPException(502, detail='Google authorization unavailable. Check your OAuth client.')
+    return JSONResponse(result, headers=AUTH_HEADERS)
+
+
+@app.post('/v1/auth/ytmusic/poll', dependencies=[Depends(admin)])
+async def ytmusic_poll(grant: GooglePoll):
+    try:
+        async with POLL_LOCK:
+            result = await google_oauth.poll(grant.handle)
+    except (httpx.HTTPError, ValueError, KeyError):
+        raise HTTPException(502, detail='Google token exchange failed.')
+    if result['status'] == 'connected':
+        submit('ytmusic', 'oauth')
+    return JSONResponse(result, headers=AUTH_HEADERS)
+
+
+@app.post('/v1/auth/apple/start', dependencies=[Depends(admin)])
+def apple_start():
+    try:
+        connect_url = apple_authorization.start()
+    except NotConfigured as exc:
+        raise HTTPException(409, detail=str(exc))
+    except (OSError, ValueError):
+        raise HTTPException(502, detail='Apple developer token unavailable. Check the MusicKit key.')
+    return JSONResponse({'connect_url': connect_url}, headers=AUTH_HEADERS)
+
+
+@app.get('/v1/auth/apple/connect', response_class=HTMLResponse)
+def apple_connect():
+    return HTMLResponse(apple_authorization.HTML, headers=AUTH_HEADERS)
+
+
+@app.post('/v1/auth/apple/complete')
+async def apple_complete(grant: AppleGrant):
+    try:
+        async with POLL_LOCK:
+            await apple_authorization.complete(grant.state, grant.user_token)
+    except ValueError:
+        raise HTTPException(400, detail='Apple authorization invalid or expired.')
+    except (httpx.HTTPError, NotConfigured):
+        raise HTTPException(502, detail='Could not verify Apple Music library access.')
+    submit('apple', 'oauth')
+    return JSONResponse({'connected': True}, headers=AUTH_HEADERS)
+
+
+async def execute_pending():
+    async with POLL_LOCK:
+        await writer.execute_next()
+
+
+class MatchApproval(BaseModel):
+    source_provider: Literal['spotify', 'ytmusic']
+    kind: Literal['track', 'artist']
+    source_id: str = Field(min_length=1, max_length=128)
+    target_id: str = Field(min_length=1, max_length=128)
+
+
+@app.get('/v1/matches/candidates', dependencies=[Depends(admin)])
+def match_candidates(provider: Literal['spotify', 'ytmusic'], kind: Literal['track', 'artist'],
+                     remote_id: str = Query(min_length=1, max_length=128)):
+    try:
+        return review.candidates(provider, kind, remote_id)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc))
+
+
+@app.post('/v1/matches/approve', dependencies=[Depends(admin)])
+def approve_match(match: MatchApproval):
+    try:
+        return review.approve(match.source_provider, match.kind, match.source_id, match.target_id)
+    except ValueError as exc:
+        raise HTTPException(409, detail=str(exc))
+
+
+@app.get('/v1/operations', dependencies=[Depends(admin)])
+def operations(limit: int = Query(30, ge=1, le=100)):
+    with connect() as con:
+        return [dict(row) for row in con.execute(
+            '''SELECT id,event_id,target_provider,operation,payload_json,status,attempt_count,last_error,
+                      created_at,completed_at FROM sync_operations ORDER BY id DESC LIMIT ?''', (limit,)
+        )]
