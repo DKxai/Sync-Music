@@ -13,7 +13,7 @@ from ..db import connect
 
 API = 'https://api.spotify.com/v1'
 AUTH = 'https://accounts.spotify.com'
-SCOPES = 'user-library-read user-library-modify user-follow-read user-follow-modify playlist-read-private playlist-read-collaborative playlist-modify-private playlist-modify-public'
+SCOPES = 'user-library-read user-follow-read playlist-read-private playlist-read-collaborative'
 
 
 def _cipher():

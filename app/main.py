@@ -61,7 +61,21 @@ def submit(provider: str, trigger='manual'):
     return {'job_id': job_id, 'provider': provider, 'already_running': False}
 
 async def scheduled_poll(provider: str):
-    submit(provider, 'scheduled')
+    if provider_ready(provider):
+        submit(provider, 'scheduled')
+
+
+def provider_ready(provider: str) -> bool:
+    if provider == 'ytmusic':
+        return settings.ytm_auth_path.is_file()
+    if provider == 'apple':
+        return bool(settings.apple_team_id and settings.apple_key_id
+                    and settings.apple_key_path.is_file()
+                    and settings.apple_user_token_path.is_file())
+    if not settings.spotify_client_id or not settings.spotify_redirect_uri:
+        return False
+    with connect() as con:
+        return con.execute("SELECT 1 FROM encrypted_tokens WHERE provider='spotify'").fetchone() is not None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -108,7 +122,10 @@ def config():
             'delete_mode': settings.delete_mode, 'confirm_polls': settings.delete_confirm_polls,
             'max_delete_percent': settings.max_delete_percent,
             'max_delete_absolute': settings.max_delete_absolute,
-            'write_enabled': False, 'baseline_approved': get_setting('baseline_approved') == 'true'}
+            'write_enabled': False, 'baseline_approved': get_setting('baseline_approved') == 'true',
+            'provider_ready': {provider: provider_ready(provider) for provider in PROVIDERS},
+            'spotify_redirect_uri': settings.spotify_redirect_uri,
+            'spotify_oauth_configured': bool(settings.spotify_client_id and settings.spotify_redirect_uri)}
 
 @app.get('/v1/accounts', dependencies=[Depends(admin)])
 def accounts():
@@ -174,4 +191,10 @@ async def spotify_callback(code: str | None = None, state: str | None = None, er
         raise HTTPException(400, 'Invalid or expired OAuth state')
     except Exception:
         raise HTTPException(502, 'Spotify token exchange failed')
-    return '<html><body><h2>Spotify connected</h2><p>You can close this page.</p></body></html>'
+    submit('spotify', 'oauth')
+    return HTMLResponse(
+        '<!doctype html><html lang="vi"><meta charset="utf-8"><title>Spotify đã kết nối</title>'
+        '<h1>Spotify đã kết nối</h1><p>Máy chủ đã xếp hàng nhập dữ liệu lần đầu.</p>'
+        '<a href="/">Về dashboard</a></html>',
+        headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'},
+    )

@@ -45,9 +45,11 @@ Do not override Botkeep's `SERVER_PORT`. Leave `DATA_DIR` unset for the `./data`
 
 ## Connect providers
 
-- **Spotify:** Create a Spotify developer app. When Botkeep assigns your HTTPS domain, set `SPOTIFY_REDIRECT_URI=https://YOUR_DOMAIN/v1/auth/spotify/callback`, and register the exact same URI at Spotify Developer Dashboard. Use `POST /v1/auth/spotify/start` with `X-API-Key` and open the returned authorization URL.
+- **Spotify:** Create a Spotify Web API app and set its Client ID as `SPOTIFY_CLIENT_ID` in Environment. Set `SPOTIFY_REDIRECT_URI=https://YOUR_DOMAIN/v1/auth/spotify/callback` and register the exact same URI in Spotify Developer Dashboard. Restart the workload, sign in to the Sync-Music dashboard, then select **Kết nối Spotify** and **Mở Spotify để cấp quyền**. The callback queues the first read-only import. The server stores the refresh token encrypted and renews access during later polls.
 - **YouTube Music:** On a trusted machine create a ytmusicapi browser auth file. Upload it privately to `private/ytmusic_browser.json` using Botkeep Files. Never commit this file.
 - **Apple Music:** Upload the MusicKit key to `private/apple_music_key.p8` and authorized user token to `private/apple_user_token.txt` in Botkeep Files; set `APPLE_TEAM_ID` and `APPLE_KEY_ID`.
+
+The scheduler runs in the Botkeep process while the dashboard is closed. It skips providers with missing credentials and checks again at the next interval. With the native launcher, YouTube Music can start importing as soon as its auth file is present. Changes to Environment values require restarting the workload. When a YouTube Music session or Apple Music user token expires, replace the associated file and run a manual import to check it.
 
 If the Botkeep runtime gives no persistent writable workspace or cannot upload private auth files, stop rather than deploy with unsafe defaults.
 
