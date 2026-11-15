@@ -1,0 +1,43 @@
+name: music-sync-hub
+services:
+  api:
+    build:
+      context: .
+    image: music-sync-hub:local
+    container_name: music-sync-hub
+    init: true
+    restart: unless-stopped
+    ports:
+      # Only reachable on the server or via an SSH tunnel.
+      - "127.0.0.1:${MUSIC_SYNC_PORT:-8787}:8787"
+    env_file: .env
+    environment:
+      DATA_DIR: /data
+      YTM_AUTH_PATH: /run/private/ytmusic_browser.json
+      APPLE_KEY_PATH: /run/private/apple_music_key.p8
+      APPLE_USER_TOKEN_PATH: /run/private/apple_user_token.txt
+    volumes:
+      - ./data:/data
+      - ./private:/run/private:ro
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 512m
+    mem_reservation: 128m
+    cpus: '0.75'
+    logging:
+      driver: json-file
+      options:
+        max-size: '5m'
+        max-file: '2'
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/health', timeout=5)"]
+      interval: 60s
+      timeout: 8s
+      retries: 3
+      start_period: 20s
