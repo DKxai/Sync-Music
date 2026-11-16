@@ -56,7 +56,7 @@ def auth_url():
         con.execute('INSERT INTO oauth_states(state,verifier_ciphertext,expires_at) VALUES(?,?,?)', (state,_cipher().encrypt(verifier.encode()),expires_at))
     scope = SCOPES
     if settings.write_enabled:
-        scope += ' user-library-modify user-follow-modify'
+        scope += ' user-library-modify user-follow-modify playlist-modify-private'
     params = dict(response_type='code',client_id=settings.spotify_client_id,redirect_uri=settings.spotify_redirect_uri,code_challenge_method='S256',code_challenge=challenge,scope=scope,state=state)
     return f'{AUTH}/authorize?{urlencode(params)}'
 
