@@ -1,4 +1,5 @@
 import asyncio
+import json
 import re
 import time
 from .base import Item, NotConfigured
@@ -39,13 +40,17 @@ def _read(stage, method, *args, **kwargs):
         match = re.match(r'Server returned HTTP ([1-5][0-9]{2})\b', str(exc))
         detail = f'HTTP {match[1]}' if match else 'YTMusicServerError'
         raise ImportRequestError(f'YouTube Music {stage}: {detail}') from None
+    except json.JSONDecodeError:
+        raise ImportRequestError(f'YouTube Music {stage}: invalid JSON') from None
+    except ValueError:
+        raise ImportRequestError(f'YouTube Music {stage}: invalid data') from None
 
 
 def _fetch_sync():
     api = _read('initialize client', client)
     likes = _read('read liked songs', api.get_liked_songs, limit=100000)
-    if not isinstance(likes, dict) or 'tracks' not in likes:
-        raise ValueError('YTMusic liked songs returned incomplete response')
+    if not isinstance(likes, dict) or not isinstance(likes.get('tracks'), list):
+        raise ImportRequestError('YouTube Music read liked songs: missing or invalid tracks list')
     out={'liked':[], 'followed_artist':[], 'owned_playlist':[]}
     for t in likes['tracks']:
         if not t.get('videoId'):continue
@@ -57,8 +62,8 @@ def _fetch_sync():
         pid=p['playlistId']
         out['owned_playlist'].append(Item('owned_playlist',pid,p.get('title') or '',kind='playlist'))
         full=_read('read playlist tracks', api.get_playlist, pid, limit=None)
-        if not isinstance(full,dict) or 'tracks' not in full:
-            raise ValueError('YTMusic playlist data incomplete')
+        if not isinstance(full, dict) or not isinstance(full.get('tracks'), list):
+            raise ImportRequestError('YouTube Music read playlist tracks: missing or invalid tracks list')
         scope=f'playlist:{pid}'
         out[scope]=[]
         for pos,t in enumerate(full['tracks']):
