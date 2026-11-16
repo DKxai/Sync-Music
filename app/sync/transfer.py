@@ -47,21 +47,24 @@ def _date(value):
 def export_library(provider):
     scope = 'library' if provider == 'apple' else 'liked'
     with connect() as con:
-        account = con.execute('SELECT last_success_at FROM accounts WHERE provider=?', (provider,)).fetchone()
-        if not account or not account['last_success_at']:
-            raise TransferError('Run a successful source import before exporting.')
+        con.execute('BEGIN')
+        snapshot = con.execute(
+            'SELECT track_count FROM library_export_snapshots WHERE provider=?', (provider,)
+        ).fetchone()
+        if snapshot is None:
+            raise TransferError('Run Sync Now for the source to capture its latest library order.')
+        if snapshot['track_count'] > MAX_TRACKS:
+            raise TransferError(f'This transfer supports up to {MAX_TRACKS} tracks at a time.')
         rows = con.execute(
-            """SELECT remote_id,payload_json FROM source_states
-               WHERE provider=? AND scope=? AND present=1 AND missing_streak=0
-               ORDER BY rowid LIMIT ?""", (provider, scope, MAX_TRACKS + 1),
+            """SELECT s.remote_id,s.payload_json FROM library_export_order o
+               JOIN source_states s ON s.provider=o.provider AND s.remote_id=o.remote_id
+               AND s.scope=? WHERE o.provider=? ORDER BY o.position LIMIT ?""",
+            (scope, provider, MAX_TRACKS),
         ).fetchall()
-    if len(rows) > MAX_TRACKS:
-        raise TransferError(f'This transfer supports up to {MAX_TRACKS} tracks at a time.')
+    if len(rows) != snapshot['track_count']:
+        raise TransferError('Source snapshot is incomplete. Run Sync Now again.')
     items = [(row['remote_id'], json.loads(row['payload_json'])) for row in rows]
     if provider == 'ytmusic':
-        if any(not isinstance(data.get('position'), int) for _, data in items):
-            raise TransferError('Run Sync Now for YouTube Music again to capture source order.')
-        items.sort(key=lambda item: item[1]['position'])
         order = 'source_order'
     elif provider == 'spotify':
         items.sort(key=lambda item: _date(item[1].get('added_at')), reverse=True)
@@ -173,6 +176,18 @@ async def execute(library, target, title, expected_plan):
                     reply.raise_for_status()
                     added += len(batch)
                     _record(key, 'running', playlist_id, added)
+                observed = []
+                for offset in range(0, len(ids), 50):
+                    reply = await api.get(f'{spotify.API}/playlists/{playlist_id}/items',
+                                          params={'offset': offset, 'limit': 50})
+                    reply.raise_for_status()
+                    page = reply.json()
+                    if page['total'] != len(ids):
+                        raise TransferError('Spotify did not verify the expected playlist size.')
+                    observed.extend((entry.get('item') or entry.get('track') or {}).get('id')
+                                    for entry in page['items'])
+                if observed != ids:
+                    raise TransferError('Spotify did not verify the expected playlist order.')
         else:
             api = await asyncio.to_thread(ytmusic.client)
             result = await asyncio.to_thread(api.create_playlist, title, 'Imported by Sync-Music',
@@ -188,6 +203,10 @@ async def execute(library, target, title, expected_plan):
                     raise TransferError('YouTube Music did not confirm the track batch.')
                 added += len(batch)
                 _record(key, 'running', playlist_id, added)
+            # Read one extra entry so an unexpected suffix cannot look like a match.
+            playlist = await asyncio.to_thread(api.get_playlist, playlist_id, limit=len(ids) + 1)
+            if [track.get('videoId') for track in playlist['tracks']] != ids:
+                raise TransferError('YouTube Music did not verify the expected playlist order.')
     except Exception:
         _record(key, 'needs_review', playlist_id, added)
         return {'status': 'needs_review', 'playlist_id': playlist_id, 'added': added}
