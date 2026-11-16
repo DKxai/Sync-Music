@@ -20,7 +20,7 @@ from .connectors.base import NotConfigured
 from .dashboard import HTML
 from .provider_tokens import has_token
 from .sync.engine import POLL_LOCK, poll
-from .sync import review, writer
+from .sync import review, transfer, writer
 
 PROVIDERS = ('spotify', 'ytmusic', 'apple')
 scheduler = AsyncIOScheduler(timezone='UTC')
@@ -305,3 +305,48 @@ def operations(limit: int = Query(30, ge=1, le=100)):
             '''SELECT id,event_id,target_provider,operation,payload_json,status,attempt_count,last_error,
                       created_at,completed_at FROM sync_operations ORDER BY id DESC LIMIT ?''', (limit,)
         )]
+
+
+class TransferPreview(BaseModel):
+    library: transfer.LibraryExport
+    target: Literal['spotify', 'ytmusic']
+
+
+class TransferExecution(TransferPreview):
+    title: str = Field(min_length=1, max_length=100)
+    plan: str = Field(pattern=r'^[a-f0-9]{64}$')
+
+
+@app.get('/v1/transfers/export/{provider}', dependencies=[Depends(admin)])
+def export_library(provider: Literal['spotify', 'ytmusic', 'apple']):
+    try:
+        library = transfer.export_library(provider)
+    except transfer.TransferError as exc:
+        raise HTTPException(409, detail=str(exc))
+    return JSONResponse(
+        library.model_dump(),
+        headers={'Cache-Control': 'no-store', 'Content-Disposition': f'attachment; filename="{provider}-library.json"'},
+    )
+
+
+@app.post('/v1/transfers/preview', dependencies=[Depends(admin)])
+def preview_transfer(payload: TransferPreview):
+    try:
+        plan = transfer.preview(payload.library, payload.target)
+    except transfer.TransferError as exc:
+        raise HTTPException(409, detail=str(exc))
+    return JSONResponse(plan, headers={'Cache-Control': 'no-store'})
+
+
+@app.post('/v1/transfers/execute', dependencies=[Depends(admin)])
+async def execute_transfer(payload: TransferExecution):
+    title = payload.title.strip()
+    if not title:
+        raise HTTPException(422, detail='Enter a playlist title.')
+    if not provider_ready(payload.target):
+        raise HTTPException(409, detail='Connect the destination service first.')
+    try:
+        async with POLL_LOCK:
+            return await transfer.execute(payload.library, payload.target, title, payload.plan)
+    except transfer.TransferError as exc:
+        raise HTTPException(409, detail=str(exc))
