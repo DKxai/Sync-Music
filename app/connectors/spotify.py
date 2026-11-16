@@ -1,4 +1,5 @@
 import base64
+import os
 from datetime import datetime, timezone, timedelta
 import hashlib
 import json
@@ -57,6 +58,8 @@ def auth_url():
     scope = SCOPES
     if settings.write_enabled:
         scope += ' user-library-modify user-follow-modify'
+    if os.getenv('PLAYLIST_TRANSFER_ENABLED', '').lower() == 'true':
+        scope += ' playlist-modify-private'
     params = dict(response_type='code',client_id=settings.spotify_client_id,redirect_uri=settings.spotify_redirect_uri,code_challenge_method='S256',code_challenge=challenge,scope=scope,state=state)
     return f'{AUTH}/authorize?{urlencode(params)}'
 

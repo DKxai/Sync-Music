@@ -87,6 +87,19 @@ def persist(provider: str, scopes: dict):
                             _event(con,provider,scope,remote_id,'removed',{'confirmed_polls':streak,'delete_mode':settings.delete_mode,'execution':'NOT_IMPLEMENTED'})
                     else:
                         con.execute('UPDATE source_states SET missing_streak=? WHERE provider=? AND scope=? AND remote_id=?',(streak,provider,scope,remote_id))
+        library_scope = 'library' if provider == 'apple' else 'liked'
+        if library_scope in scopes:
+            ordered_tracks = scopes[library_scope]
+            con.execute('DELETE FROM library_export_order WHERE provider=?', (provider,))
+            con.executemany(
+                'INSERT INTO library_export_order(provider,position,remote_id) VALUES (?,?,?)',
+                ((provider, index, item.remote_id) for index, item in enumerate(ordered_tracks)),
+            )
+            con.execute(
+                """INSERT INTO library_export_snapshots(provider,track_count) VALUES (?,?)
+                   ON CONFLICT(provider) DO UPDATE SET track_count=excluded.track_count""",
+                (provider, len(ordered_tracks)),
+            )
         con.execute('UPDATE snapshot_runs SET status="complete",completed_at=datetime("now"),scope_counts_json=? WHERE id=?',(json.dumps({k:len(v) for k,v in scopes.items()}),run))
         con.execute('UPDATE accounts SET status="connected",last_success_at=datetime("now"),last_error=NULL,updated_at=datetime("now") WHERE provider=?',(provider,))
     return {'provider':provider,'scopes':{k:len(v) for k,v in scopes.items()},'baseline_approved':baseline,'remote_writes':'enabled_for_reviewed_additions' if settings.write_enabled else 'disabled'}
