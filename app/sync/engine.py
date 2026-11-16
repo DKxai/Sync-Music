@@ -39,13 +39,19 @@ def _event(con,provider,scope,remote_id,kind,details):
     if kind == 'added':
         plan_add(con, event.lastrowid, provider, scope, remote_id)
 
+class SnapshotValidationError(ValueError):
+    """Validation failure containing only predefined dashboard-safe labels."""
+
+
 def persist(provider: str, scopes: dict):
     if not scopes or not isinstance(scopes,dict):
-        raise ValueError('Provider returned no complete scope data; refusing snapshot')
+        raise SnapshotValidationError('Provider returned no complete scope data; refusing snapshot')
     for scope,items in scopes.items():
-        if not isinstance(items,list): raise ValueError(f'Incomplete {scope} snapshot')
-        if len(items)!=len(set(i.remote_id for i in items)):
-            raise ValueError(f'Duplicate remote IDs in {scope}')
+        label = scope if scope in ('liked', 'followed_artist', 'owned_playlist', 'library') else 'playlist or library scope'
+        if not isinstance(items, list):
+            raise SnapshotValidationError(f'Incomplete snapshot: {label}')
+        if len(items) != len({item.remote_id for item in items}):
+            raise SnapshotValidationError(f'Duplicate remote IDs: {label}; snapshot rejected')
     with connect() as con:
         run=con.execute('INSERT INTO snapshot_runs(provider,status) VALUES(?,?)',(provider,'running')).lastrowid
         # Single transaction: either ALL scopes commit or NONE do.
@@ -94,7 +100,7 @@ async def poll(provider: str):
             return persist(provider,scopes)
         except Exception as exc:
             # No partial snapshot is committed on error.
-            if isinstance(exc, (NotConfigured, ytmusic.ImportRequestError)):
+            if isinstance(exc, (NotConfigured, ytmusic.ImportRequestError, SnapshotValidationError)):
                 message = str(exc)
             elif isinstance(exc, HTTPStatusError):
                 message = f'Provider returned HTTP {exc.response.status_code}'
