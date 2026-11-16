@@ -2,17 +2,18 @@
 import asyncio
 import hashlib
 import json
+import os
 from datetime import datetime
 
 import httpx
 from pydantic import BaseModel, Field
 
-from ..config import settings
 from ..connectors import spotify, ytmusic
 from ..db import connect
 from .matcher import preview_score
 
 MAX_TRACKS = 1000
+PLAYLIST_TRANSFER_ENABLED = os.getenv('PLAYLIST_TRANSFER_ENABLED', '').lower() == 'true'
 
 
 class TransferError(ValueError):
@@ -137,8 +138,8 @@ def _record(key, status, playlist_id=None, added=0):
 
 
 async def execute(library, target, title, expected_plan):
-    if not settings.write_enabled:
-        raise TransferError('Playlist transfers require WRITE_ENABLED=true.')
+    if not PLAYLIST_TRANSFER_ENABLED:
+        raise TransferError('Playlist transfers require PLAYLIST_TRANSFER_ENABLED=true.')
     plan = preview(library, target)
     if plan['plan'] != expected_plan:
         raise TransferError('The match list changed. Preview again before copying.')
