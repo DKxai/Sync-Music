@@ -34,6 +34,18 @@ HTML = r'''<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name
 <div class="flex"><button id="audit">Xem sự kiện và thao tác</button><button id="baseline">Duyệt bản nhập ban đầu</button></div>
 <p id="reviewMessage" role="status"></p><pre id="auditResults"></pre>
 </section>
+<section id="transfer" hidden>
+<strong>Nhập và xuất thư viện</strong>
+<p><label>Nguồn <select id="transferSource"><option value="ytmusic">YouTube Music Liked Music</option><option value="spotify">Spotify Liked Songs</option><option value="apple">Thư viện Apple Music</option></select></label></p>
+<div class="flex"><button id="transferExport">Tải JSON</button><button id="transferLoad">Lấy dữ liệu nguồn</button></div>
+<p><label>Mở tệp đã xuất <input id="transferFile" type="file" accept=".json,application/json"></label></p>
+<p><label>Đích <select id="transferTarget"><option value="spotify">Spotify</option><option value="ytmusic">YouTube Music</option></select></label></p>
+<button id="transferPreview">Xem trước bản ghép</button>
+<ol id="transferTracks"></ol>
+<p><label>Tên playlist riêng <input id="transferTitle" maxlength="100"></label></p>
+<button id="transferExecute" disabled>Tạo playlist và nhập bài đã ghép</button>
+<p id="transferStatus" role="status"></p>
+</section>
 <section><strong>Trạng thái</strong><pre id="status">Chưa kết nối</pre></section>
 <script>
 let apiKey='';let connected=false;let refreshHandle;let googleGrant;let googleTimer;
@@ -52,6 +64,7 @@ async function update(){if(!connected)return;try{
   const [accounts,jobs,config]=await Promise.all([request('/v1/accounts'),request('/v1/sync/status'),request('/v1/config')]);
   $('providers').hidden=false;
   $('review').hidden=false;
+  $('transfer').hidden=false;
   $('baseline').disabled=config.baseline_approved || !accounts.every(account=>account.last_success_at && account.status==='connected');
   $('spotifyAuthorize').disabled=!config.spotify_oauth_configured;
   $('ytmusicAuthorize').disabled=!config.ytmusic_oauth_configured || Boolean(googleGrant);
@@ -76,7 +89,7 @@ async function update(){if(!connected)return;try{
   let busy=Object.values(jobs).some(x=>x.state==='queued'||x.state==='running');
   document.querySelectorAll('button[data-provider]').forEach(b=>b.disabled=busy);
 }catch(e){$('status').textContent=e.message}}
-$('connect').addEventListener('click',async()=>{clearTimeout(googleTimer);googleGrant=undefined;$('ytmusicLink').hidden=true;$('ytmusicMessage').textContent='';$('appleLink').hidden=true;apiKey=$('token').value.trim();$('token').value='';try{await request('/v1/config');connected=true;$('message').textContent='Đã kết nối. Bạn có thể chạy Sync Now.';await update();clearInterval(refreshHandle);refreshHandle=setInterval(()=>{if(!document.hidden)update()},5000)}catch(e){connected=false;apiKey='';$('providers').hidden=true;$('review').hidden=true;$('spotifyLink').hidden=true;$('message').textContent='Không thể kết nối: '+e.message}});
+$('connect').addEventListener('click',async()=>{clearTimeout(googleTimer);googleGrant=undefined;$('ytmusicLink').hidden=true;$('ytmusicMessage').textContent='';$('appleLink').hidden=true;apiKey=$('token').value.trim();$('token').value='';try{await request('/v1/config');connected=true;$('message').textContent='Đã kết nối. Bạn có thể chạy Sync Now.';await update();clearInterval(refreshHandle);refreshHandle=setInterval(()=>{if(!document.hidden)update()},5000)}catch(e){connected=false;apiKey='';$('providers').hidden=true;$('review').hidden=true;$('transfer').hidden=true;$('spotifyLink').hidden=true;$('message').textContent='Không thể kết nối: '+e.message}});
 $('spotifyAuthorize').addEventListener('click',async()=>{
   $('spotifyLink').hidden=true;
   $('spotifyMessage').textContent='';
@@ -159,5 +172,85 @@ $('baseline').addEventListener('click',async()=>{
     await update();
   } catch(e) { $('reviewMessage').textContent=e.message; }
 });
+let transferLibrary, transferPlan;
+const transferStatus = message => { $('transferStatus').textContent=message; };
+function resetTransferPreview() {
+  transferPlan=undefined;
+  $('transferTracks').replaceChildren();
+  $('transferExecute').disabled=true;
+}
+const loadTransferSource=()=>request('/v1/transfers/export/'+$('transferSource').value);
+$('transferSource').onchange=()=>{transferLibrary=undefined;resetTransferPreview();};
+$('transferTarget').onchange=resetTransferPreview;
+$('transferLoad').onclick=async()=>{
+  resetTransferPreview();
+  transferLibrary=undefined;
+  const source=$('transferSource').value;
+  try {
+    const library=await loadTransferSource();
+    if (source!==$('transferSource').value) return;
+    transferLibrary=library;
+    transferStatus('Đã đọc '+library.tracks.length+' bài.');
+  } catch(e) { transferStatus(e.message); }
+};
+$('transferExport').onclick=async()=>{
+  try {
+    const data=await loadTransferSource();
+    const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));
+    const link=document.createElement('a');
+    link.href=url;
+    link.download=data.provider+'-library.json';
+    link.click();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  } catch(e) { transferStatus(e.message); }
+};
+$('transferFile').onchange=async()=>{
+  resetTransferPreview();
+  transferLibrary=undefined;
+  const file=$('transferFile').files[0];
+  if (!file) return;
+  try {
+    if (file.size>3000000) throw new Error('Tệp vượt quá 3 MB.');
+    const data=JSON.parse(await file.text());
+    if (file!==$('transferFile').files[0]) return;
+    if (data.version!==1 || !Array.isArray(data.tracks)) throw new Error('Định dạng tệp xuất không hợp lệ.');
+    transferLibrary=data;
+    transferStatus('Đã mở tệp có '+data.tracks.length+' bài.');
+  } catch(e) { transferStatus(e.message); }
+};
+$('transferPreview').onclick=async()=>{
+  resetTransferPreview();
+  const library=transferLibrary, target=$('transferTarget').value;
+  try {
+    if (!library) throw new Error('Hãy lấy dữ liệu nguồn hoặc mở tệp xuất trước.');
+    const plan=await request('/v1/transfers/preview','POST',{library,target});
+    if (library!==transferLibrary || target!==$('transferTarget').value) return;
+    transferPlan=plan;
+    for (const track of plan.tracks) {
+      const item=document.createElement('li');
+      item.textContent=[track.title,track.artist,track.target_id ? 'đã ghép ('+track.match+')' : 'chưa ghép'].filter(Boolean).join(' · ');
+      $('transferTracks').append(item);
+    }
+    transferStatus('Đã ghép '+plan.matched+'/'+plan.total+' bài.');
+    $('transferExecute').disabled=!plan.matched;
+  } catch(e) { transferStatus(e.message); }
+};
+$('transferExecute').onclick=async()=>{
+  const title=$('transferTitle').value.trim();
+  if (!title || !transferPlan) {
+    transferStatus('Nhập tên playlist sau khi xem trước.');
+    return;
+  }
+  const payload={library:transferLibrary,target:$('transferTarget').value,title,plan:transferPlan.plan};
+  $('transferExecute').disabled=true;
+  try {
+    const result=await request('/v1/transfers/execute','POST',payload);
+    transferStatus('Kết quả '+result.status+' · '+result.added+' bài'
+      +(result.playlist_id ? ' · ID playlist '+result.playlist_id : ''));
+  } catch(e) {
+    transferStatus(e.message);
+    if (transferPlan?.plan===payload.plan) $('transferExecute').disabled=false;
+  }
+};
 document.querySelectorAll('button[data-provider]').forEach(b=>b.addEventListener('click',async()=>{if(!connected)return;$('message').textContent='Đang xếp hàng: '+b.dataset.provider;try{let p=await request('/v1/sync/'+b.dataset.provider,'POST');$('message').textContent='Đã nhận tác vụ: '+JSON.stringify(p);await update()}catch(e){$('message').textContent='Lỗi: '+e.message}}));
 </script></body></html>'''
