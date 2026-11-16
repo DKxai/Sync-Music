@@ -52,9 +52,13 @@ def _fetch_sync():
     if not isinstance(likes, dict) or not isinstance(likes.get('tracks'), list):
         raise ImportRequestError('YouTube Music read liked songs: missing or invalid tracks list')
     out={'liked':[], 'followed_artist':[], 'owned_playlist':[]}
+    liked_ids = set()
     for t in likes['tracks']:
-        if not t.get('videoId'):continue
-        out['liked'].append(Item('liked',t['videoId'],t.get('title') or '',artist=', '.join(a.get('name','') for a in t.get('artists') or []),album=(t.get('album') or {}).get('name'),duration_ms=(t.get('duration_seconds') or 0)*1000 or None))
+        video_id = t.get('videoId')
+        if not video_id or video_id in liked_ids:
+            continue
+        liked_ids.add(video_id)
+        out['liked'].append(Item('liked',video_id,t.get('title') or '',artist=', '.join(a.get('name','') for a in t.get('artists') or []),album=(t.get('album') or {}).get('name'),duration_ms=(t.get('duration_seconds') or 0)*1000 or None))
     for a in _read('read artist subscriptions', api.get_library_subscriptions, limit=100000):
         if a.get('browseId'):out['followed_artist'].append(Item('followed_artist',a['browseId'],a.get('artist') or '',kind='artist'))
     for p in _read('list library playlists', api.get_library_playlists, limit=None):
