@@ -128,3 +128,13 @@ CREATE TABLE IF NOT EXISTS reviewed_links (
   CHECK(source_provider<>target_provider)
 );
 CREATE INDEX IF NOT EXISTS operation_status_idx ON sync_operations(status, id);
+
+CREATE TABLE IF NOT EXISTS playlist_transfers (
+  transfer_key TEXT PRIMARY KEY,
+  target TEXT NOT NULL CHECK(target IN ('spotify','ytmusic')),
+  title TEXT NOT NULL,
+  status TEXT NOT NULL,
+  playlist_id TEXT,
+  added INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS music_title_idx ON music_items(title COLLATE NOCASE);
