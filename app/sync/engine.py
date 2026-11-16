@@ -94,7 +94,7 @@ async def poll(provider: str):
             return persist(provider,scopes)
         except Exception as exc:
             # No partial snapshot is committed on error.
-            if isinstance(exc, NotConfigured):
+            if isinstance(exc, (NotConfigured, ytmusic.ImportRequestError)):
                 message = str(exc)
             elif isinstance(exc, HTTPStatusError):
                 message = f'Provider returned HTTP {exc.response.status_code}'
