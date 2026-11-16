@@ -138,3 +138,14 @@ CREATE TABLE IF NOT EXISTS playlist_transfers (
   added INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS music_title_idx ON music_items(title COLLATE NOCASE);
+
+CREATE TABLE IF NOT EXISTS library_export_snapshots (
+  provider TEXT PRIMARY KEY REFERENCES accounts(provider),
+  track_count INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS library_export_order (
+  provider TEXT NOT NULL REFERENCES accounts(provider),
+  position INTEGER NOT NULL,
+  remote_id TEXT NOT NULL,
+  PRIMARY KEY(provider,position)
+);
