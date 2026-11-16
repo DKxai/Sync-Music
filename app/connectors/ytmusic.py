@@ -1,4 +1,5 @@
 import asyncio
+import re
 import time
 from .base import Item, NotConfigured
 from ..config import settings
@@ -25,22 +26,37 @@ def client():
     return YTMusic(str(settings.ytm_auth_path))
 
 
+class ImportRequestError(Exception):
+    """Safe error metadata for the dashboard and import audit."""
+
+
+def _read(stage, method, *args, **kwargs):
+    from ytmusicapi.exceptions import YTMusicServerError
+
+    try:
+        return method(*args, **kwargs)
+    except YTMusicServerError as exc:
+        match = re.match(r'Server returned HTTP ([1-5][0-9]{2})\b', str(exc))
+        detail = f'HTTP {match[1]}' if match else 'YTMusicServerError'
+        raise ImportRequestError(f'YouTube Music {stage}: {detail}') from None
+
+
 def _fetch_sync():
-    api = client()
-    likes = api.get_liked_songs(limit=100000)
+    api = _read('initialize client', client)
+    likes = _read('read liked songs', api.get_liked_songs, limit=100000)
     if not isinstance(likes, dict) or 'tracks' not in likes:
         raise ValueError('YTMusic liked songs returned incomplete response')
     out={'liked':[], 'followed_artist':[], 'owned_playlist':[]}
     for t in likes['tracks']:
         if not t.get('videoId'):continue
         out['liked'].append(Item('liked',t['videoId'],t.get('title') or '',artist=', '.join(a.get('name','') for a in t.get('artists') or []),album=(t.get('album') or {}).get('name'),duration_ms=(t.get('duration_seconds') or 0)*1000 or None))
-    for a in api.get_library_subscriptions(limit=100000):
+    for a in _read('read artist subscriptions', api.get_library_subscriptions, limit=100000):
         if a.get('browseId'):out['followed_artist'].append(Item('followed_artist',a['browseId'],a.get('artist') or '',kind='artist'))
-    for p in api.get_library_playlists(limit=None):
+    for p in _read('list library playlists', api.get_library_playlists, limit=None):
         if not p.get('owned') or not p.get('playlistId'):continue
         pid=p['playlistId']
         out['owned_playlist'].append(Item('owned_playlist',pid,p.get('title') or '',kind='playlist'))
-        full=api.get_playlist(pid,limit=None)
+        full=_read('read playlist tracks', api.get_playlist, pid, limit=None)
         if not isinstance(full,dict) or 'tracks' not in full:
             raise ValueError('YTMusic playlist data incomplete')
         scope=f'playlist:{pid}'
