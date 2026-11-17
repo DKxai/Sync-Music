@@ -12,6 +12,8 @@ from app.connectors import spotify
 from app.connectors.base import Item
 from app.sync import direct, direct_results, undo
 from app.sync.destinations import SpotifyDestination
+from app.sync.matcher import catalog_match
+from app.sync.transfer import ExportTrack
 
 
 @pytest.fixture
@@ -126,7 +128,7 @@ def test_two_way_uses_one_snapshot_per_provider_and_separate_undo_ids(database, 
 def test_search_budget_distinguishes_waiting_from_no_match(database, monkeypatch):
     monkeypatch.setattr(direct, 'MAX_SEARCHES', 1)
     monkeypatch.setattr(direct, '_local_match', lambda *_: (None, 'unmatched', None))
-    monkeypatch.setattr(direct, '_catalog_match', AsyncMock(return_value=None))
+    monkeypatch.setattr(direct, '_catalog_match', AsyncMock(return_value=(None, 'not_found')))
     source = {'liked': [Item('liked', 'first', 'No match'),
                         Item('liked', 'second', 'Not yet searched')], 'owned_playlist': []}
     result = dict(unmatched=0, search_deferred=0)
@@ -135,6 +137,95 @@ def test_search_budget_distinguishes_waiting_from_no_match(database, monkeypatch
     assert result == dict(unmatched=1, search_deferred=1)
     assert direct_results.list_items('unmatched', 0, 25)['items'][0]['title'] == 'No match'
     assert direct_results.list_items('deferred', 0, 25)['items'][0]['title'] == 'Not yet searched'
+
+
+def test_catalog_matches_video_metadata_and_equivalent_editions():
+    track = ExportTrack(source_id='yt1', title='Đường Về (feat. Mai) [Official Music Video]',
+                        artist='Linh - Topic', duration_ms=200000)
+    candidates = [('first', 'Duong Ve', 'Mai, Linh', 200500, 'VN123'),
+                  ('same-recording', 'Duong Ve', 'Linh, Mai', 201000, 'VN123'),
+                  ('remix', 'Duong Ve - Remix', 'Linh, Mai', 200000, 'VN456'),
+                  ('cover', 'Duong Ve', 'Other Artist', 200000, 'VN789')]
+    assert catalog_match(track, candidates) == ('first', None)
+    assert catalog_match(track, candidates[2:]) == (None, 'insufficient')
+    candidates.append(('another-recording', 'Duong Ve', 'Linh, Mai', 200000, 'VN987'))
+    assert catalog_match(track, candidates) == (None, 'ambiguous')
+
+
+def test_spotify_fallback_results_are_cached(database):
+    track = ExportTrack(source_id='yt1', title='Đường Về', artist='Linh', duration_ms=200000)
+    adapter = SpotifyDestination(None)
+    adapter.search = AsyncMock(return_value=[])
+    adapter.search_fallback = AsyncMock(return_value=[('sp1', 'Duong Ve', 'Linh', 201000, 'VN123')])
+    assert asyncio.run(direct._catalog_match(adapter, 'ytmusic', 'spotify', track)) == ('sp1', None)
+    assert direct._local_match('ytmusic', 'spotify', track)[2]['target_id'] == 'sp1'
+
+
+def test_spotify_rate_limit_defers_lookups_and_writes_without_caching_misses(database):
+    adapter = SpotifyDestination(None)
+    response = httpx.Response(429, request=httpx.Request('GET', f'{spotify.API}/search'))
+    adapter.search = AsyncMock(side_effect=[
+        [('sp1', 'First song', 'Artist', 200000, None)],
+        httpx.HTTPStatusError('rate limited', request=response.request, response=response),
+    ])
+    adapter.account = AsyncMock()
+    source = {'liked': [Item('liked', key, title, artist='Artist', duration_ms=200000)
+                        for key, title in [('yt1', 'First song'), ('yt2', 'Second song'), ('yt3', 'Third song')]],
+              'owned_playlist': []}
+    result = dict(unmatched=0, search_deferred=0, writes_deferred=0)
+    asyncio.run(direct._apply('job', 'ytmusic', 'spotify', source, {}, adapter, result))
+
+    assert result == dict(unmatched=0, search_deferred=2, writes_deferred=1, spotify_rate_limited=True)
+    assert direct_results.list_items('deferred', 0, 25)['total'] == 3
+    with db.connect() as con:
+        assert [row['source_id'] for row in con.execute('SELECT source_id FROM direct_catalog_cache')] == ['yt1']
+    adapter.account.assert_not_awaited()
+
+
+def test_spotify_playlist_failure_does_not_stop_other_playlists(database, monkeypatch):
+    def library(ids, *, spotify_playlist):
+        return [Item('owned_playlist', key if spotify_playlist else 'source-' + key, key,
+                     kind='playlist', raw={'owned_by_me': True, 'public': None}) for key in ids]
+
+    playlist_ids = ('bad', 'good')
+    source = {'liked': [], 'owned_playlist': library(playlist_ids, spotify_playlist=False)}
+    for key in playlist_ids:
+        source[f'playlist:source-{key}'] = [Item(f'playlist:source-{key}', key + '-song', key)]
+    target = {'liked': [], 'owned_playlist': library(playlist_ids, spotify_playlist=True)}
+    monkeypatch.setattr(direct, '_local_match', lambda _, __, track: (track.source_id, 'reviewed', None))
+    tracks, posted = [], []
+    snapshots = iter(['old', 'new', 'new', 'added', 'added'])
+
+    def send(request):
+        path = request.url.path
+        if path.endswith('/me'):
+            return httpx.Response(200, json={'id': 'owner', 'account_id': 'stable-owner'})
+        if path.endswith('/bad'):
+            return httpx.Response(200, json={'owner': {'id': 'owner'}, 'public': True, 'snapshot_id': 'none'})
+        if path.endswith('/good'):
+            if 'fields' in request.url.params:
+                return httpx.Response(200, json={'snapshot_id': 'partial'})
+            return httpx.Response(200, json={'owner': {'id': 'owner'}, 'public': False,
+                                             'snapshot_id': next(snapshots)})
+        assert path.endswith('/good/items')
+        if request.method == 'POST':
+            posted.append(path)
+            tracks.append('good-song')
+            return httpx.Response(201, json={'snapshot_id': 'added'})
+        return httpx.Response(200, json={'items': [{'item': {'id': value}} for value in tracks], 'next': None})
+
+    result = dict(unmatched=0, search_deferred=0, writes_deferred=0, playlist_tracks_added=0, playlists_need_review=0)
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(send)) as http:
+            await direct._apply('job', 'ytmusic', 'spotify', source, target, SpotifyDestination(http), result)
+
+    asyncio.run(go())
+    assert posted == ['/v1/playlists/good/items']
+    assert result['playlists_need_review'] == result['playlist_tracks_added'] == 1
+    assert undo.history()[0]['confirmed'] == 1
+    failed = direct_results.list_items('failed', 0, 25)['items']
+    assert len(failed) == 1 and 'công khai' in failed[0]['reason']
 
 
 def test_sync_all_includes_apple_when_ready(monkeypatch):
