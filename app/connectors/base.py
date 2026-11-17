@@ -15,3 +15,7 @@ class Item:
 
 class NotConfigured(Exception):
     pass
+
+
+class ProviderResponseError(ValueError):
+    """A provider response failed validation. The message is safe to display."""

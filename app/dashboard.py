@@ -192,10 +192,16 @@ async function update(){
     } else if (config[provider+'_oauth_configured']) {
       status='Chờ cấp quyền';
     }
+    if (provider==='spotify' && config.provider_ready.spotify) {
+      const retryAt=jobs.spotify?.retry_at || config.spotify_retry_at;
+      status='Đã cấp quyền Spotify · '+(retryAt
+        ? 'Spotify giới hạn yêu cầu. Tự thử lại từ '+retryTime(retryAt)
+        : status==='Đã cấu hình, chờ nhập lần đầu' ? 'Chờ nhập thư viện' : status);
+    }
     $(provider+'Status').textContent=status;
-    $(provider+'Card').dataset.connected=String(account?.status==='connected');
+    $(provider+'Card').dataset.connected=String(provider==='spotify' ? config.provider_ready.spotify : account?.status==='connected');
   }
-  $('status').textContent=JSON.stringify({mode:config.write_enabled?'REVIEWED ADDITIONS':direct.enabled?'DIRECT TRANSFER':'READ-ONLY',baseline_approved:config.baseline_approved,poll_minutes:config.poll_minutes,accounts,jobs},null,2);
+  $('status').textContent=JSON.stringify({mode:config.write_enabled?'REVIEWED ADDITIONS':direct.enabled?'DIRECT TRANSFER':'READ-ONLY',baseline_approved:config.baseline_approved,poll_minutes:config.poll_minutes,accounts,jobs,direct_sync:direct.job},null,2);
   let busy=Object.values(jobs).some(x=>x.state==='queued'||x.state==='running');
   document.querySelectorAll('button[data-provider]').forEach(b=>{
     b.disabled=busy || (b.dataset.provider==='all' ? !Object.values(config.provider_ready).some(Boolean)
@@ -241,6 +247,7 @@ const stages={waiting:'Đang chờ',check_permissions:'Đang kiểm tra quyền 
 const states={idle:'Chưa chạy',queued:'Đang chờ',running:'Đang nhập',completed:'Hoàn tất',failed:'Gặp lỗi',
   interrupted:'Bị gián đoạn',partial:'Hoàn tất một phần'};
 const count=(v,n)=>v ? v+' '+n : '';
+const retryTime=seconds=>new Date(seconds*1000).toLocaleString('vi-VN',{dateStyle:'short',timeStyle:'short'});
 function showProgress(el,done,total) {
   if(total){el.max=total;el.value=done;}else{el.removeAttribute('value');}
 }
@@ -280,8 +287,9 @@ function renderDirect(data,config) {
          ...(!busy ? [count(r.unmatched,'mục chưa ghép'),count(r.tracks_failed,'mục gặp lỗi'),
            count(r.search_deferred,'mục chờ tra cứu'),count(r.writes_deferred,'mục chờ ghi lượt sau'),
            count(r.playlists_need_review,'playlist cần kiểm tra')] : [])];
-    const retry=busy && job.retry_at ? 'Tự tiếp tục từ '+new Date(job.retry_at*1000).toLocaleTimeString('vi-VN') : '';
-    $('directResult').textContent=[r.error,...pieces,
+    const retry=busy && job.retry_at ? 'Tự tiếp tục từ '+retryTime(job.retry_at) : '';
+    const error=r.error && stages[job.stage] ? `${stages[job.stage]} · ${r.error}` : r.error;
+    $('directResult').textContent=[error,...pieces,
       retry || (r.spotify_rate_limited?'Spotify đang giới hạn yêu cầu. Sync-Music sẽ tiếp tục ở lượt sau.':''),
       r.schedule_paused?'Đã tạm dừng lịch.':''].filter(Boolean).join(' · ');
     if(!busy && $('directMessage').textContent==='Đã xếp hàng.') $('directMessage').textContent='';
@@ -448,7 +456,8 @@ function renderImports(jobs){
     if(job.state==='idle')continue;
     const box=document.createElement('div'), label=document.createElement('p'), bar=document.createElement('progress');
     box.className='jobbox';
-    label.textContent=names[provider]+' · '+states[job.state]+(job.result?.error?' · '+job.result.error:'');
+    const phase=job.retry_at ? 'Đang chờ giới hạn yêu cầu · Thử lại từ '+retryTime(job.retry_at) : states[job.state];
+    label.textContent=names[provider]+' · '+phase+(job.result?.error?' · '+job.result.error:'');
     bar.setAttribute('aria-label','Tiến độ nhập '+names[provider]);
     const working=job.state==='running'||job.state==='queued';
     showProgress(bar,job.state==='completed'?1:0,working?0:1);

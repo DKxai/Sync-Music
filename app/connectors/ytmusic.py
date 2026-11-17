@@ -2,7 +2,7 @@ import asyncio
 import json
 import re
 import time
-from .base import Item, NotConfigured
+from .base import Item, NotConfigured, ProviderResponseError
 from ..config import settings
 from ..provider_tokens import load_token, save_token
 
@@ -27,7 +27,7 @@ def client():
     return YTMusic(str(settings.ytm_auth_path))
 
 
-class ImportRequestError(Exception):
+class ImportRequestError(ProviderResponseError):
     """Safe error metadata for the dashboard and import audit."""
 
 
@@ -42,8 +42,17 @@ def _read(stage, method, *args, **kwargs):
         raise ImportRequestError(f'YouTube Music {stage}: {detail}') from None
     except json.JSONDecodeError:
         raise ImportRequestError(f'YouTube Music {stage}: invalid JSON') from None
+    except KeyError:
+        raise ImportRequestError(f'YouTube Music {stage}: response missing expected data') from None
     except ValueError:
         raise ImportRequestError(f'YouTube Music {stage}: invalid data') from None
+
+
+async def call(stage, method, *args, **kwargs):
+    try:
+        return await asyncio.to_thread(method, *args, **kwargs)
+    except KeyError:
+        raise ProviderResponseError(f'YouTube Music không trả đủ dữ liệu khi {stage}.') from None
 
 
 def _fetch_sync():

@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import time
 from typing import Literal
 from uuid import uuid4
 
@@ -15,7 +16,7 @@ from .config import settings, validate
 from .db import init_db, connect, get_setting, prune_history
 from . import apple_authorization
 from .connectors import apple, google_oauth, spotify
-from .connectors.base import NotConfigured
+from .connectors.base import NotConfigured, ProviderResponseError
 from .dashboard import HTML
 from .dashboard_session import admin, router as dashboard_session_router
 from .provider_tokens import has_token
@@ -36,13 +37,21 @@ async def _run_job(job_id: str, provider: str):
     job['state'] = 'running'
     job['started_at'] = timestamp()
     try:
-        result = await poll(provider)
+        while True:
+            result = await poll(provider)
+            retry_at = result.get('retry_at')
+            if retry_at is None:
+                break
+            job['retry_at'] = retry_at
+            # poll() releases its lock before returning a cooldown.
+            await asyncio.sleep(max(0, retry_at - time.time()))
         job['result'] = result
         job['state'] = 'failed' if 'error' in result else 'completed'
     except Exception as exc:
         job['result'] = {'error': f'{type(exc).__name__}: {str(exc)[:250]}'}
         job['state'] = 'failed'
     finally:
+        job.pop('retry_at', None)
         job['finished_at'] = timestamp()
         if _active.get(provider) == job_id:
             del _active[provider]
@@ -66,6 +75,8 @@ def submit(provider: str, trigger='manual'):
     return {'job_id': job_id, 'provider': provider, 'already_running': False}
 
 async def scheduled_poll(provider: str):
+    if provider == 'spotify' and direct.ENABLED and direct_schedule_ready(direct.rule()):
+        return  # The direct sync already reads Spotify's library.
     if provider_ready(provider):
         submit(provider, 'scheduled')
 
@@ -77,11 +88,15 @@ def provider_ready(provider: str) -> bool:
         return apple.developer_configured() and (settings.apple_user_token_path.is_file() or has_token('apple'))
     return bool(settings.spotify_client_id and settings.spotify_redirect_uri and has_token('spotify'))
 
+def direct_schedule_ready(rule):
+    return rule and rule['scheduled'] and direct.directions(rule['source'], rule['target']) and all(
+        provider_ready(provider) for provider in direct.SERVICES
+    )
+
+
 async def scheduled_direct_sync():
     rule = direct.rule()
-    if rule and rule['scheduled'] and direct.directions(rule['source'], rule['target']) and all(
-        provider_ready(provider) for provider in direct.SERVICES
-    ):
+    if direct_schedule_ready(rule):
         direct.submit(rule['source'], rule['target'])
 
 
@@ -136,6 +151,7 @@ def config():
             'max_delete_absolute': settings.max_delete_absolute,
             'write_enabled': settings.write_enabled, 'baseline_approved': get_setting('baseline_approved') == 'true',
             'provider_ready': {provider: provider_ready(provider) for provider in PROVIDERS},
+            'spotify_retry_at': spotify.api_retry_at(),
             'spotify_redirect_uri': settings.spotify_redirect_uri,
             'ytmusic_oauth_configured': google_oauth.configured(),
             'apple_oauth_configured': apple_authorization.configured(),
@@ -273,14 +289,21 @@ async def spotify_callback(code: str | None = None, state: str | None = None, er
     try:
         async with POLL_LOCK:
             await spotify.redeem(code, state)
+    except ProviderResponseError as exc:
+        raise HTTPException(502, detail=str(exc)) from exc
     except ValueError:
         raise HTTPException(400, 'Invalid or expired OAuth state')
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 429:
+            raise HTTPException(429, 'Spotify đang giới hạn yêu cầu cấp token. Thử lại sau.') from exc
+        raise HTTPException(502, f'Spotify từ chối cấp token (HTTP {exc.response.status_code}).') from exc
     except Exception:
         raise HTTPException(502, 'Spotify token exchange failed')
     submit('spotify', 'oauth')
     return HTMLResponse(
         '<!doctype html><html lang="vi"><meta charset="utf-8"><title>Spotify đã kết nối</title>'
-        '<h1>Spotify đã kết nối</h1><p>Máy chủ đã xếp hàng nhập dữ liệu lần đầu.</p>'
+        '<h1>Đã cấp quyền Spotify</h1><p>Máy chủ đang xử lý lượt nhập thư viện. '
+        'Nếu Spotify giới hạn yêu cầu, lượt nhập sẽ tự tiếp tục sau thời gian chờ.</p>'
         '<a href="/">Về dashboard</a></html>',
         headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'},
     )

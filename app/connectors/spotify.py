@@ -5,14 +5,16 @@ import os
 from datetime import datetime, timezone, timedelta
 import hashlib
 import json
+from math import ceil
 import secrets
+import time
 from urllib.parse import urlencode
 
 from cryptography.fernet import Fernet
 import httpx
-from .base import Item, NotConfigured
+from .base import Item, NotConfigured, ProviderResponseError
 from ..config import settings
-from ..db import connect
+from ..db import connect, get_setting
 from ..provider_tokens import invalidate_account
 
 API = 'https://api.spotify.com/v1'
@@ -20,22 +22,45 @@ AUTH = 'https://accounts.spotify.com'
 SCOPES = 'user-library-read user-follow-read playlist-read-private playlist-read-collaborative'
 DIRECT_WRITE_SCOPES = frozenset({'user-library-modify', 'playlist-modify-private'})
 rate_limit_waiter = ContextVar('spotify_rate_limit_waiter', default=None)
+COOLDOWN_SETTING = 'spotify_api_retry_at'
 
 
 class MissingWriteScope(ValueError):
     pass
 
 
-async def wait_after_rate_limit(response):
-    waiter = rate_limit_waiter.get()
-    if (waiter is None or response.status_code != 429
-            or response.request.url.host not in ('api.spotify.com', 'accounts.spotify.com')):
-        return False
+def api_retry_at():
+    deadline = int(get_setting(COOLDOWN_SETTING) or 0)
+    return deadline if deadline > time.time() else None
+
+
+def record_rate_limit(response):
+    if response.status_code != 429:
+        return None
+    host = response.request.url.host
+    if host not in ('api.spotify.com', 'accounts.spotify.com'):
+        return None
     try:
         delay = max(1, int(response.headers.get('Retry-After', '30')))
     except ValueError:
         delay = 30
-    await waiter(delay)
+    deadline = ceil(time.time() + delay)
+    if host == 'api.spotify.com':
+        with connect() as con:
+            row = con.execute(
+                """INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE
+                   SET value=MAX(CAST(settings.value AS INTEGER), CAST(excluded.value AS INTEGER))
+                   RETURNING value""", (COOLDOWN_SETTING, str(deadline)),
+            ).fetchone()
+            deadline = int(row[0])
+    return deadline
+
+
+async def wait_after_rate_limit(response):
+    waiter = rate_limit_waiter.get()
+    if waiter is None or (deadline := record_rate_limit(response)) is None:
+        return False
+    await waiter(deadline)
     return True
 
 
@@ -76,6 +101,30 @@ def _require_scopes(tokens, required):
 
 def _cipher():
     return Fernet(settings.encryption_key.encode())
+
+
+def response_object(response, operation):
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if not isinstance(data, dict):
+        raise ProviderResponseError(f'Spotify {operation}: phản hồi không đúng định dạng.')
+    return data
+
+
+def _token_response(response):
+    response.raise_for_status()
+    data = response_object(response, 'cấp token')
+    try:
+        expires_in = int(data.get('expires_in'))
+    except (TypeError, ValueError):
+        expires_in = 0
+    if not isinstance(data.get('access_token'), str) or not data['access_token'] or expires_in <= 0:
+        raise ProviderResponseError('Spotify cấp token: phản hồi thiếu token hoặc thời hạn hợp lệ.')
+    data['expires_at'] = (datetime.now(timezone.utc) + timedelta(seconds=expires_in - 60)).timestamp()
+    data['client_id'] = settings.spotify_client_id
+    return data
 
 
 def _load_tokens():
@@ -140,12 +189,9 @@ async def redeem(code: str, state: str):
     verifier = _cipher().decrypt(row['verifier_ciphertext']).decode()
     async with httpx.AsyncClient(timeout=30) as client:
         r = await client.post(f'{AUTH}/api/token', data={'grant_type':'authorization_code','code':code,'redirect_uri':settings.spotify_redirect_uri,'client_id':settings.spotify_client_id,'code_verifier':verifier})
-        r.raise_for_status()
-        data = r.json()
-    data['expires_at'] = (datetime.now(timezone.utc) + timedelta(seconds=int(data['expires_in'])-60)).timestamp()
+        data = _token_response(r)
     if not data.get('refresh_token'):
-        raise ValueError('Spotify did not issue a refresh token')
-    data['client_id'] = settings.spotify_client_id
+        raise ProviderResponseError('Spotify cấp token: phản hồi thiếu refresh token.')
     _save_tokens(data, reconnect=True)
 
 
@@ -153,7 +199,7 @@ async def access_token(*, required_scopes=frozenset()):
     tokens = _load_tokens()
     if tokens.get('client_id', settings.spotify_client_id) != settings.spotify_client_id:
         raise NotConfigured('Spotify Client ID changed. Reconnect Spotify.')
-    if tokens.get('expires_at',0) > datetime.now(timezone.utc).timestamp():
+    if tokens.get('access_token') and tokens.get('expires_at',0) > datetime.now(timezone.utc).timestamp():
         _require_scopes(tokens, required_scopes)
         return tokens['access_token']
     if not tokens.get('refresh_token'):
@@ -161,10 +207,7 @@ async def access_token(*, required_scopes=frozenset()):
     async with httpx.AsyncClient(timeout=30) as client:
         r = await request(client, 'POST', f'{AUTH}/api/token', retry_rate_limit=True,
                           data={'grant_type':'refresh_token','refresh_token':tokens['refresh_token'],'client_id':settings.spotify_client_id})
-        r.raise_for_status()
-        data = r.json()
-    data['expires_at'] = (datetime.now(timezone.utc) + timedelta(seconds=int(data['expires_in'])-60)).timestamp()
-    data['client_id'] = settings.spotify_client_id
+        data = _token_response(r)
     _save_tokens(data)
     _require_scopes(data, required_scopes)
     return data['access_token']
@@ -174,17 +217,19 @@ async def fetch():
     token = await access_token()
     headers = {'Authorization':f'Bearer {token}'}
     async with httpx.AsyncClient(timeout=35, headers=headers) as client:
-        async def paged(url, params=None, root='items'):
+        async def paged(url, operation, params=None):
             results=[]
             while url:
                 r=await request(client, 'GET', url, params=params)
                 r.raise_for_status()  # incomplete pagination aborts the entire provider poll
-                data=r.json()
-                results.extend(data.get(root,[]))
+                data=response_object(r, operation)
+                if not isinstance(data.get('items'), list):
+                    raise ProviderResponseError(f'Spotify {operation}: phản hồi thiếu danh sách kết quả.')
+                results.extend(data['items'])
                 url=data.get('next')
                 params=None
             return results
-        likes = await paged(f'{API}/me/tracks', {'limit':50})
+        likes = await paged(f'{API}/me/tracks', 'đọc bài đã thích', {'limit':50})
         follow=[]
         after=None
         while True:
@@ -192,14 +237,19 @@ async def fetch():
             if after: params['after']=after
             r=await request(client, 'GET', f'{API}/me/following', params=params)
             r.raise_for_status()
-            d=r.json().get('artists',{})
-            follow.extend(d.get('items',[]))
+            d=response_object(r, 'đọc nghệ sĩ đã theo dõi').get('artists')
+            if not isinstance(d, dict) or not isinstance(d.get('items'), list):
+                raise ProviderResponseError('Spotify đọc nghệ sĩ đã theo dõi: phản hồi thiếu danh sách kết quả.')
+            follow.extend(d['items'])
             after=(d.get('cursors') or {}).get('after')
             if not d.get('next') or not after: break
-        playlists = await paged(f'{API}/me/playlists', {'limit':50})
+        playlists = await paged(f'{API}/me/playlists', 'đọc danh sách playlist', {'limit':50})
         me_resp = await request(client, 'GET', f'{API}/me')
         me_resp.raise_for_status()
-        my_id = me_resp.json().get('id')
+        profile = response_object(me_resp, 'đọc tài khoản')
+        my_id = profile.get('id') or profile.get('account_id')
+        if not my_id:
+            raise ProviderResponseError('Spotify đọc tài khoản: phản hồi thiếu mã tài khoản.')
         out={'liked':[], 'followed_artist':[], 'owned_playlist':[]}
         for entry in likes:
             track=entry.get('track') or {}
@@ -213,7 +263,7 @@ async def fetch():
             if not p.get('id'): continue
             out['owned_playlist'].append(Item('owned_playlist',p['id'],p.get('name') or '',kind='playlist',raw={'snapshot_id':p.get('snapshot_id'),'collaborative':p.get('collaborative'),'owned_by_me':bool(my_id and owner == my_id),'public':p.get('public')}))
             # Spotify Development Mode 2026: only owned/collaborative items are supported.
-            items = await paged(f"{API}/playlists/{p['id']}/items", {'limit':50})
+            items = await paged(f"{API}/playlists/{p['id']}/items", 'đọc bài trong playlist', {'limit':50})
             scope=f"playlist:{p['id']}"
             out[scope]=[]
             occurrences={}

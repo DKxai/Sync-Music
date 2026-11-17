@@ -4,7 +4,8 @@ from itertools import count
 
 import httpx
 
-from ..connectors import spotify
+from ..connectors import spotify, ytmusic
+from ..connectors.base import ProviderResponseError
 from .matcher import catalog_title
 from .undo import fingerprint
 
@@ -15,7 +16,10 @@ def batches(ids, size):
 
 
 def artist_names(values):
-    return ', '.join(value['name'] for value in values or [] if value.get('name'))
+    if not isinstance(values, list):
+        return ''
+    return ', '.join(value['name'] for value in values if isinstance(value, dict)
+                     and isinstance(value.get('name'), str) and value['name'])
 
 
 class PlaylistConflict(ValueError):
@@ -54,10 +58,13 @@ class SpotifyDestination:
 
     async def _search(self, query):
         result = await self.request('GET', '/search', params={'q': query, 'type': 'track', 'limit': 10})
+        tracks = spotify.response_object(result, 'tra cứu bài hát').get('tracks')
+        if not isinstance(tracks, dict) or not isinstance(tracks.get('items'), list):
+            raise ProviderResponseError('Spotify tra cứu bài hát: phản hồi thiếu danh sách kết quả.')
         return [
             (item['id'], item.get('name'), artist_names(item.get('artists')),
              item.get('duration_ms'), (item.get('external_ids') or {}).get('isrc'))
-            for item in result.json()['tracks']['items'] if item.get('id') and item.get('is_playable') is not False
+            for item in tracks['items'] if isinstance(item, dict) and item.get('id') and item.get('is_playable') is not False
         ]
 
     async def account(self):
@@ -154,7 +161,10 @@ class SpotifyDestination:
 
     async def create_playlist(self, title):
         result = await self.request('POST', '/me/playlists', json={'name': title, 'public': False})
-        return result.json()['id']
+        playlist_id = spotify.response_object(result, 'tạo playlist').get('id')
+        if not isinstance(playlist_id, str) or not playlist_id:
+            raise ProviderResponseError('Spotify tạo playlist: phản hồi thiếu mã playlist.')
+        return playlist_id
 
     async def playlist_tracks(self, playlist_id):
         tracks = []
@@ -186,8 +196,8 @@ class YouTubeDestination:
         self.api = api
 
     async def search(self, track):
-        results = await asyncio.to_thread(self.api.search, f'{catalog_title(track.title)} {track.artist or ""}',
-                                          filter='songs', limit=8)
+        results = await ytmusic.call('tra cứu bài hát', self.api.search,
+                                    f'{catalog_title(track.title)} {track.artist or ""}', filter='songs', limit=8)
         return [
             (item['videoId'], item.get('title'), artist_names(item.get('artists')),
              (item.get('duration_seconds') or 0) * 1000 or None, None)
@@ -195,11 +205,11 @@ class YouTubeDestination:
         ]
 
     async def account(self):
-        info = await asyncio.to_thread(self.api.get_account_info)
+        info = await ytmusic.call('đọc thông tin tài khoản', self.api.get_account_info)
         return info.get('channelHandle')
 
     async def owns_playlist(self, playlist_id):
-        playlists = await asyncio.to_thread(self.api.get_library_playlists, limit=None)
+        playlists = await ytmusic.call('đọc danh sách playlist', self.api.get_library_playlists, limit=None)
         return any(item.get('playlistId') == playlist_id and item.get('owned') for item in playlists)
 
     async def apply_likes(self, ids, journal):
@@ -211,7 +221,7 @@ class YouTubeDestination:
             if video_id in existing:
                 continue
             entry = journal.record('likes', [video_id])
-            await asyncio.to_thread(self.api.rate_song, video_id, LikeStatus.LIKE)
+            await ytmusic.call('ghi lượt thích', self.api.rate_song, video_id, LikeStatus.LIKE)
             entries.append((entry, video_id))
         observed = await self.liked_ids()
         for entry, video_id in entries:
@@ -233,14 +243,13 @@ class YouTubeDestination:
 
     async def liked_ids(self):
         limit = 100000
-        data = await asyncio.to_thread(self.api.get_liked_songs, limit=limit)
+        data = await ytmusic.call('đọc lượt thích', self.api.get_liked_songs, limit=limit)
         if not isinstance(data.get('tracks'), list) or len(data['tracks']) >= limit:
             raise ValueError('YouTube Music liked tracks could not be verified.')
         return {item.get('videoId') for item in data['tracks']}
 
     async def undo_playlist(self, playlist_id, ids, guard):
-        playlist = await asyncio.to_thread(self.api.get_playlist, playlist_id, limit=None)
-        tracks = playlist['tracks']
+        tracks = await self._playlist_rows(playlist_id)
         entries = {track.get('setVideoId'): track for track in tracks if track.get('setVideoId')}
         remove = []
         for video_id, item_id in zip(ids, guard.get('item_ids', []), strict=True):
@@ -252,30 +261,34 @@ class YouTubeDestination:
             remove.append(item)
         if remove:
             await asyncio.to_thread(self.api.remove_playlist_items, playlist_id, remove)
-            observed = await asyncio.to_thread(self.api.get_playlist, playlist_id, limit=None)
-            return not {item.get('setVideoId') for item in observed['tracks']}.intersection(guard['item_ids'])
+            observed = await self._playlist_rows(playlist_id)
+            return not {item.get('setVideoId') for item in observed}.intersection(guard['item_ids'])
         return True
 
     async def create_playlist(self, title):
-        result = await asyncio.to_thread(self.api.create_playlist, title, 'Synced by Sync-Music',
-                                         privacy_status='PRIVATE')
+        result = await ytmusic.call('tạo playlist', self.api.create_playlist, title, 'Synced by Sync-Music',
+                                    privacy_status='PRIVATE')
         if not isinstance(result, str) or not result:
             raise ValueError('YouTube Music did not confirm playlist creation.')
         return result
 
+    async def _playlist_rows(self, playlist_id):
+        playlist = await ytmusic.call('đọc playlist', self.api.get_playlist, playlist_id, limit=None)
+        if not isinstance(playlist, dict) or not isinstance(playlist.get('tracks'), list):
+            raise ProviderResponseError('YouTube Music đọc playlist: phản hồi thiếu danh sách bài hát.')
+        return playlist['tracks']
+
     async def playlist_tracks(self, playlist_id):
-        playlist = await asyncio.to_thread(self.api.get_playlist, playlist_id, limit=None)
-        return [row.get('videoId') for row in playlist['tracks']]
+        return [row.get('videoId') for row in await self._playlist_rows(playlist_id)]
 
     async def append(self, playlist_id, ids):
-        playlist = await asyncio.to_thread(self.api.get_playlist, playlist_id, limit=None)
-        before = {item.get('setVideoId') for item in playlist['tracks']}
+        before = {item.get('setVideoId') for item in await self._playlist_rows(playlist_id)}
         for batch in batches(ids, 100):
-            result = await asyncio.to_thread(self.api.add_playlist_items, playlist_id, batch, duplicates=True)
+            result = await ytmusic.call('thêm bài vào playlist', self.api.add_playlist_items, playlist_id, batch,
+                                        duplicates=True)
             if not isinstance(result, dict) or result.get('status') != 'STATUS_SUCCEEDED':
                 raise ValueError('YouTube Music did not confirm the track batch.')
-        playlist = await asyncio.to_thread(self.api.get_playlist, playlist_id, limit=None)
-        added = [item for item in playlist['tracks'] if item.get('setVideoId') not in before]
+        added = [item for item in await self._playlist_rows(playlist_id) if item.get('setVideoId') not in before]
         return [item['setVideoId'] for item in added] if (
             [item.get('videoId') for item in added] == ids and all(item.get('setVideoId') for item in added)
         ) else None
