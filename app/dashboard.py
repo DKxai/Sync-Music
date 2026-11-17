@@ -280,7 +280,9 @@ function renderDirect(data,config) {
          count(r.unmatched,'mục chưa ghép'),count(r.search_deferred,'mục chờ tra cứu'),
          count(r.writes_deferred,'mục chờ ghi lượt sau'),
          count(r.playlists_need_review,'playlist cần kiểm tra')];
-    $('directResult').textContent=[r.error,...pieces,r.schedule_paused?'Đã tạm dừng lịch.':''].filter(Boolean).join(' · ');
+    $('directResult').textContent=[r.error,...pieces,
+      r.spotify_rate_limited?'Spotify đang giới hạn yêu cầu. Sync-Music sẽ tiếp tục ở lượt sau.':'',
+      r.schedule_paused?'Đã tạm dừng lịch.':''].filter(Boolean).join(' · ');
     if(!busy && $('directMessage').textContent==='Đã xếp hàng.') $('directMessage').textContent='';
   }
   const historyKey=JSON.stringify([history,enabled,busy,directBusy]);

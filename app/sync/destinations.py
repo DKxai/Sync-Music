@@ -4,6 +4,7 @@ import asyncio
 import httpx
 
 from ..connectors import spotify
+from .matcher import catalog_title
 from .undo import fingerprint
 
 
@@ -16,18 +17,37 @@ def artist_names(values):
     return ', '.join(value['name'] for value in values or [] if value.get('name'))
 
 
+class PlaylistConflict(ValueError):
+    pass
+
+
 class SpotifyDestination:
     def __init__(self, http):
         self.http = http
+        self._profile = None
 
     async def request(self, method, path, **kwargs):
         result = await self.http.request(method, f'{spotify.API}{path}', **kwargs)
+        retry_after = result.headers.get('Retry-After', '')
+        if result.status_code == 429 and method == 'GET' and retry_after in ('1', '2', '3', '4', '5'):
+            await asyncio.sleep(int(retry_after))
+            result = await self.http.request(method, f'{spotify.API}{path}', **kwargs)
         result.raise_for_status()
         return result
 
     async def search(self, track):
-        query = f'isrc:{track.isrc}' if track.isrc else f'{track.title} {track.artist or ""}'
-        result = await self.request('GET', '/search', params={'q': query, 'type': 'track', 'limit': 8})
+        query = f'isrc:{track.isrc}' if track.isrc else f'{catalog_title(track.title)} {track.artist or ""}'.strip()
+        return await self._search(query)
+
+    async def search_fallback(self, track):
+        title = catalog_title(track.title)
+        if not title or not (track.artist or track.isrc):
+            return []
+        query = f'{title} {track.artist or ""}'.strip() if track.isrc else title
+        return await self._search(query)
+
+    async def _search(self, query):
+        result = await self.request('GET', '/search', params={'q': query, 'type': 'track', 'limit': 10})
         return [
             (item['id'], item.get('name'), artist_names(item.get('artists')),
              item.get('duration_ms'), (item.get('external_ids') or {}).get('isrc'))
@@ -35,8 +55,9 @@ class SpotifyDestination:
         ]
 
     async def account(self):
-        profile = (await self.request('GET', '/me')).json()
-        return profile.get('account_id') or profile.get('id')
+        if self._profile is None:
+            self._profile = (await self.request('GET', '/me')).json()
+        return self._profile.get('account_id') or self._profile.get('id')
 
     async def _saved(self, ids):
         uris = ','.join(f'spotify:track:{value}' for value in ids)
@@ -68,18 +89,37 @@ class SpotifyDestination:
             if await self._saved(batch) != [False] * len(batch):
                 raise ValueError('Spotify could not verify removed likes.')
 
-    async def playlist_value(self, playlist_id):
+    async def _playlist_snapshot(self, playlist_id):
         path = f'/playlists/{playlist_id}'
-        params = {'fields': 'snapshot_id,public,collaborative'}
-        before = (await self.request('GET', path, params=params)).json()
-        ids = await self.playlist_tracks(playlist_id)
-        after = (await self.request('GET', path, params=params)).json()
-        if not before.get('snapshot_id') or before != after or after.get('public') is not False or after.get('collaborative'):
-            raise ValueError('Spotify playlist changed or is no longer private.')
-        return ids, after['snapshot_id']
+        account = await self.account()
+        params = {'fields': 'snapshot_id,public,collaborative,owner(id)'}
+        details = (await self.request('GET', path, params=params)).json()
+        if not details.get('snapshot_id') or not details.get('owner') or details.get('public') is None:
+            details = (await self.request('GET', path)).json()
+        owner = (details.get('owner') or {}).get('id')
+        if not owner or owner not in (self._profile.get('id'), account):
+            raise PlaylistConflict('Spotify không xác nhận playlist thuộc tài khoản đang kết nối.')
+        if details.get('public') is True or details.get('collaborative'):
+            raise PlaylistConflict('Playlist Spotify đang công khai hoặc bật cộng tác. Chỉ ghi vào playlist riêng tư.')
+        if details.get('public') is not False or not details.get('snapshot_id'):
+            raise PlaylistConflict('Spotify thiếu thông tin quyền riêng tư hoặc phiên bản của playlist.')
+        return details['snapshot_id']
+
+    async def playlist_value(self, playlist_id):
+        before = await self._playlist_snapshot(playlist_id)
+        for _ in range(2):
+            ids = await self.playlist_tracks(playlist_id)
+            after = await self._playlist_snapshot(playlist_id)
+            if before == after:
+                return ids, after
+            before = after
+        raise PlaylistConflict('Playlist Spotify thay đổi trong lúc đọc. Hệ thống sẽ thử lại ở lượt sau.')
 
     async def undo_playlist(self, playlist_id, ids, guard):
-        current, snapshot = await self.playlist_value(playlist_id)
+        try:
+            current, snapshot = await self.playlist_value(playlist_id)
+        except PlaylistConflict:
+            return False
         if fingerprint(current) == guard['before']:
             return True
         if snapshot != guard['snapshot'] or fingerprint(current) != guard['after'] or not guard['unique']:
@@ -87,7 +127,10 @@ class SpotifyDestination:
         items = [{'uri': f'spotify:track:{value}'} for value in dict.fromkeys(ids)]
         await self.request('DELETE', f'/playlists/{playlist_id}/items',
                            json={'snapshot_id': snapshot, 'items': items})
-        observed, restored_snapshot = await self.playlist_value(playlist_id)
+        try:
+            observed, restored_snapshot = await self.playlist_value(playlist_id)
+        except PlaylistConflict:
+            return False
         return restored_snapshot if fingerprint(observed) == guard['before'] else False
 
     async def create_playlist(self, title):
@@ -98,8 +141,11 @@ class SpotifyDestination:
         tracks = []
         url = f'/playlists/{playlist_id}/items'
         for offset in range(0, 10050, 50):
-            response = await self.request('GET', url, params={'offset': offset, 'limit': 50})
+            response = await self.request('GET', url, params={'offset': offset, 'limit': 50,
+                                                             'fields': 'items(item(id),track(id)),next'})
             data = response.json()
+            if 'next' not in data or not isinstance(data.get('items'), list):
+                raise PlaylistConflict('Spotify trả về danh sách bài hát không đầy đủ.')
             for row in data['items']:
                 track = row.get('item') or row.get('track') or {}
                 tracks.append(track.get('id'))
@@ -120,7 +166,7 @@ class YouTubeDestination:
         self.api = api
 
     async def search(self, track):
-        results = await asyncio.to_thread(self.api.search, f'{track.title} {track.artist or ""}',
+        results = await asyncio.to_thread(self.api.search, f'{catalog_title(track.title)} {track.artist or ""}',
                                           filter='songs', limit=8)
         return [
             (item['videoId'], item.get('title'), artist_names(item.get('artists')),

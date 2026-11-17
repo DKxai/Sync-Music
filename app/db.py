@@ -34,6 +34,10 @@ def init_db():
         columns = {row['name'] for row in con.execute('PRAGMA table_info(direct_sync_items)')}
         if 'collection_key' not in columns:
             con.execute('ALTER TABLE direct_sync_items ADD COLUMN collection_key TEXT')
+        columns = {row['name'] for row in con.execute('PRAGMA table_info(direct_catalog_cache)')}
+        if 'reason' not in columns:
+            con.execute('ALTER TABLE direct_catalog_cache ADD COLUMN reason TEXT')
+            con.execute('DELETE FROM direct_catalog_cache WHERE target_id IS NULL')
 
 def get_setting(name: str):
     with connect() as con:

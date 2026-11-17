@@ -14,17 +14,25 @@ from ..connectors import spotify, ytmusic
 from ..connectors.base import Item
 from ..db import connect
 from . import direct_results, undo
-from .destinations import SpotifyDestination, YouTubeDestination, batches
+from .destinations import PlaylistConflict, SpotifyDestination, YouTubeDestination, batches
 from .engine import FETCHERS, POLL_LOCK, persist
-from .matcher import preview_score
+from .matcher import catalog_match
 from .transfer import ExportTrack, _match
 
 ENABLED = os.getenv('AUTO_TRANSFER_ENABLED', '').lower() == 'true'
 SERVICES = ('spotify', 'ytmusic')
 BOTH = 'both'
 REMOTE_ID = re.compile(r'[A-Za-z0-9_-]{1,160}')
-MAX_SEARCHES = 40
+MAX_SEARCHES = 120
+MAX_YOUTUBE_SEARCHES = 40
+SPOTIFY_MUTATIONS = 400
 MAX_MUTATIONS = 200
+NO_MATCH_REASONS = {
+    'ambiguous': 'Có nhiều bản ghi phù hợp, cần duyệt bản ghép.',
+    'insufficient': 'Có kết quả, nhưng tên bài, nghệ sĩ, thời lượng hoặc mã bản ghi chưa đủ khớp.',
+    'not_found': 'Dịch vụ đích không trả kết quả cho bài này.',
+    'missing_title': 'Nguồn thiếu tên bài để tra cứu.',
+}
 _task = None
 
 
@@ -108,38 +116,32 @@ def _local_match(source, target, track):
     with connect() as con:
         match, method = _match(con, source, target, track)
         cached = con.execute(
-            """SELECT target_id FROM direct_catalog_cache WHERE source=? AND source_id=?
+            """SELECT target_id,reason FROM direct_catalog_cache WHERE source=? AND source_id=?
                AND target=? AND expires_at>?""", (source, track.source_id, target, int(time.time())),
         ).fetchone()
     return match, method, cached
 
 
 async def _catalog_match(adapter, source, target, track):
-    results = await adapter.search(track)
-    results = [row for row in results if REMOTE_ID.fullmatch(row[0])]
-    exact_codes = {candidate_id for candidate_id, _, _, _, isrc in results
-                   if track.isrc and isrc == track.isrc}
-    strong = exact_codes or {
-        candidate_id for candidate_id, title, artist, duration, isrc in results
-        if not (track.isrc and isrc and track.isrc != isrc)
-        and preview_score(track.title, track.artist, track.duration_ms, title, artist, duration) == 1
-    }
-    match = next(iter(strong)) if len(strong) == 1 else None
+    candidates = [row for row in await adapter.search(track) if REMOTE_ID.fullmatch(row[0])]
+    match, reason = catalog_match(track, candidates)
+    if target == 'spotify' and reason in ('not_found', 'insufficient'):
+        fallback = await adapter.search_fallback(track)
+        candidates.extend(row for row in fallback if REMOTE_ID.fullmatch(row[0]))
+        match, reason = catalog_match(track, candidates)
     with connect() as con:
         con.execute(
-            """INSERT INTO direct_catalog_cache VALUES (?,?,?,?,?)
+            """INSERT INTO direct_catalog_cache(source,source_id,target,target_id,expires_at,reason)
+               VALUES (?,?,?,?,?,?)
                ON CONFLICT(source,source_id,target) DO UPDATE
-               SET target_id=excluded.target_id,expires_at=excluded.expires_at""",
-            (source, track.source_id, target, match, int(time.time()) + (30 if match else 1)*86400),
+               SET target_id=excluded.target_id,expires_at=excluded.expires_at,reason=excluded.reason""",
+            (source, track.source_id, target, match, int(time.time()) + (30 if match else 7)*86400, reason),
         )
-    return match
+    return match, reason
 
 
 def _owned_playlist(item, target):
-    return target == 'ytmusic' or (
-        item.raw.get('owned_by_me') is True and item.raw.get('public') is False
-        and not item.raw.get('collaborative')
-    )
+    return target == 'ytmusic' or item.raw.get('owned_by_me') is True
 
 
 def _bind(source, target, playlist, target_id):
@@ -175,7 +177,7 @@ async def _playlist_id(adapter, source, target, playlist, destination):
         if (len(named) != 1 or not _owned_playlist(named[0], target)
                 or not REMOTE_ID.fullmatch(named[0].remote_id)):
             return None
-        return named[0].remote_id if _bind(source, target, playlist, named[0].remote_id) else None
+        return named[0].remote_id
     if previous:
         # A timed-out creation may still exist. Never blindly create a second playlist.
         return None
@@ -207,6 +209,8 @@ async def _plan(job_id, source, target, source_data, adapter, result):
     progress(job_id, 'running', 'match_tracks', 0, total, result)
     matches, plans = {}, []
     done = searches = 0
+    limit = MAX_SEARCHES if target == 'spotify' else MAX_YOUTUBE_SEARCHES
+    rate_limited = False
     with connect() as con:
         con.execute('DELETE FROM direct_catalog_cache WHERE expires_at<=?', (int(time.time()),))
     for playlist, items in collections:
@@ -219,26 +223,38 @@ async def _plan(job_id, source, target, source_data, adapter, result):
                 track = ExportTrack(source_id=source_id, title=item.title,
                                     artist=item.artist, duration_ms=item.duration_ms, isrc=item.isrc)
                 match, method, cached = _local_match(source, target, track)
-                state, reason = 'unmatched', 'Không tìm thấy bản ghi đủ tin cậy.'
+                state = 'unmatched'
+                reason = None
                 if method == 'ambiguous':
-                    reason = 'Có nhiều bản ghi phù hợp, cần duyệt bản ghép.'
+                    reason = 'ambiguous'
                 elif not match and cached is not None:
-                    match = cached['target_id']
-                elif not match and track.title:
-                    if searches < MAX_SEARCHES:
+                    match, reason = cached['target_id'], cached['reason']
+                elif not match:
+                    if not (track.title.strip() or track.isrc):
+                        reason = 'missing_title'
+                    elif rate_limited or searches >= limit:
+                        state, reason = 'deferred', 'Chờ tra cứu danh mục ở lượt sau.'
+                    else:
                         searches += 1
                         try:
-                            match = await _catalog_match(adapter, source, target, track)
+                            match, reason = await _catalog_match(adapter, source, target, track)
                         except Exception as exc:
-                            rows.append((done, item.title, item.artist, 'failed', _error(exc)))
-                            direct_results.record(job_id, source, target, collection, rows, collection_key=collection_key)
-                            raise
-                    else:
-                        state, reason = 'deferred', 'Chờ tra cứu danh mục ở lượt sau.'
+                            if (target == 'spotify' and isinstance(exc, httpx.HTTPStatusError)
+                                    and exc.response.status_code == 429):
+                                rate_limited = True
+                                state = 'deferred'
+                            else:
+                                rows.append((done, item.title, item.artist, 'failed', _error(exc)))
+                                direct_results.record(job_id, source, target, collection, rows, collection_key=collection_key)
+                                raise
+                    if state == 'deferred' and rate_limited:
+                        reason = 'Spotify giới hạn yêu cầu (HTTP 429). Bài này sẽ được tra cứu ở lượt sau.'
                 if match and REMOTE_ID.fullmatch(match):
                     state, reason = 'pending', 'Đã ghép, đang chờ ghi vào dịch vụ đích.'
                 else:
                     match = None
+                    if state == 'unmatched':
+                        reason = NO_MATCH_REASONS.get(reason, NO_MATCH_REASONS['insufficient'])
                 matches[source_id] = match, state, reason
             match, state, reason = matches[source_id]
             if state == 'deferred':
@@ -249,13 +265,15 @@ async def _plan(job_id, source, target, source_data, adapter, result):
                 result['unmatched'] += 1
             rows.append((done, item.title, item.artist, state, reason))
             done += 1
-            if len(rows) >= 10:
+            if len(rows) >= 25:
                 direct_results.record(job_id, source, target, collection, rows, collection_key=collection_key)
                 rows.clear()
                 progress(job_id, 'running', 'match_tracks', done, total, result)
         if rows:
             direct_results.record(job_id, source, target, collection, rows, collection_key=collection_key)
         plans.append((playlist, tracks))
+    if rate_limited:
+        result['spotify_rate_limited'] = True
     progress(job_id, 'running', 'match_tracks', done, total, result)
     return plans
 
@@ -279,6 +297,10 @@ def _work(tracks, present, *, unique=False):
 
 async def _apply(job_id, source, target, source_data, target_data, adapter, result, transfer_id=None):
     plans = await _plan(job_id, source, target, source_data, adapter, result)
+    if target == 'spotify' and result.get('spotify_rate_limited'):
+        for _, tracks in plans:
+            _defer_writes(job_id, source, tracks, result, 'Spotify giới hạn yêu cầu (HTTP 429). Chờ ghi ở lượt sau.')
+        return
     account = await adapter.account()
     if not account:
         raise ValueError('Cannot identify the destination account for safe undo.')
@@ -287,7 +309,7 @@ async def _apply(job_id, source, target, source_data, target_data, adapter, resu
     if target == 'spotify':
         undo.resolve_absent_spotify_likes(account, target_likes)
     destination = list(target_data['owned_playlist'])
-    remaining = MAX_MUTATIONS
+    remaining = SPOTIFY_MUTATIONS if target == 'spotify' else MAX_MUTATIONS
     for index, (playlist, tracks) in enumerate(plans):
         progress(job_id, 'running', 'write_collections', index, len(plans), result)
         if not tracks:
@@ -330,10 +352,7 @@ async def _write_playlist(job_id, source, target, adapter, journal, playlist, tr
         playlist_id = (await _playlist_id(adapter, source, target, playlist, destination)
                        if 0 < len(playlist.title.strip()) <= 100 else None)
         if not playlist_id:
-            result['playlists_need_review'] += 1
-            direct_results.mark(job_id, source, tracks, 'failed',
-                                'Playlist đích trùng tên, thiếu quyền sở hữu hoặc cần kiểm tra.')
-            return 0
+            raise PlaylistConflict('Playlist đích trùng tên, thiếu quyền sở hữu hoặc cần kiểm tra.')
         if not any(item.remote_id == playlist_id for item in destination):
             destination.append(Item('owned_playlist', playlist_id, playlist.title, kind='playlist',
                                     raw={'owned_by_me': True, 'public': False}))
@@ -341,9 +360,11 @@ async def _write_playlist(job_id, source, target, adapter, journal, playlist, tr
             old, _ = await adapter.playlist_value(playlist_id)
         else:
             old = await adapter.playlist_tracks(playlist_id)
+        if not _bind(source, target, playlist, playlist_id):
+            raise PlaylistConflict('Playlist đích đã liên kết với một playlist nguồn khác.')
     except Exception as exc:
-        direct_results.mark(job_id, source, tracks, 'failed', _error(exc))
-        raise
+        _playlist_failure(job_id, source, target, tracks, result, exc)
+        return 0
     covered, missing = _work(tracks, old)
     direct_results.mark(job_id, source, covered, 'synced')
     limit = min(100, remaining)
@@ -358,15 +379,24 @@ async def _write_playlist(job_id, source, target, adapter, journal, playlist, tr
             guard = await _playlist_guard(adapter, target, playlist_id, old, ids, receipt)
             journal.confirm(entry, guard)
         except Exception as exc:
-            direct_results.mark(job_id, source, selected, 'failed', _error(exc))
-            raise
+            _playlist_failure(job_id, source, target, selected, result, exc)
+            return len(selected)
         direct_results.mark(job_id, source, selected, 'synced')
     return len(selected)
 
 
-def _defer_writes(job_id, source, tracks, result):
+def _playlist_failure(job_id, source, target, tracks, result, exc):
+    direct_results.mark(job_id, source, tracks, 'failed', _error(exc))
+    if not (isinstance(exc, PlaylistConflict) or (
+        target == 'spotify' and isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (403, 404)
+    )):
+        raise exc
+    result['playlists_need_review'] += 1
+
+
+def _defer_writes(job_id, source, tracks, result, reason='Chờ lượt sau do giới hạn số mục ghi mỗi lượt.'):
     result['writes_deferred'] += len(tracks)
-    direct_results.mark(job_id, source, tracks, 'deferred', 'Chờ lượt sau do giới hạn số mục ghi mỗi lượt.')
+    direct_results.mark(job_id, source, tracks, 'deferred', reason)
 
 
 async def _playlist_guard(adapter, target, playlist_id, old, added, receipt):
@@ -377,7 +407,7 @@ async def _playlist_guard(adapter, target, playlist_id, old, added, receipt):
                     'snapshot': snapshot, 'unique': not set(added).intersection(old)}
     elif receipt and await adapter.playlist_tracks(playlist_id) == old + added:
         return {'item_ids': receipt}
-    raise ValueError('The destination playlist needs review after writing.')
+    raise PlaylistConflict('Playlist đích đã nhận yêu cầu ghi, nhưng thứ tự hoặc phiên bản sau ghi chưa được xác minh.')
 
 
 @asynccontextmanager
@@ -459,7 +489,7 @@ def _error(exc):
         if status_code == 403:
             return operation + '. Cấp lại quyền Spotify. Nếu vẫn lỗi, kiểm tra quyền ứng dụng trong Spotify Developer Dashboard.'
         return operation
-    if type(exc) is ValueError:
+    if type(exc) is ValueError or isinstance(exc, PlaylistConflict):
         return str(exc)
     return f'Direct sync stopped ({type(exc).__name__}).'
 

@@ -190,6 +190,7 @@ CREATE TABLE IF NOT EXISTS direct_catalog_cache (
   target TEXT NOT NULL,
   target_id TEXT,
   expires_at INTEGER NOT NULL,
+  reason TEXT,
   PRIMARY KEY(source,source_id,target)
 );
 
