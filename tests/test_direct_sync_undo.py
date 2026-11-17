@@ -1,8 +1,10 @@
 import asyncio
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
 
 from app import db
-from app.sync import undo
+from app.connectors.base import Item
+from app.sync import direct, undo
 from app.sync.destinations import SpotifyDestination, YouTubeDestination
 
 
@@ -54,3 +56,83 @@ def test_youtube_removes_only_the_added_occurrence():
     adapter = YouTubeDestination(playlist)
     assert asyncio.run(adapter.undo_playlist('playlist', ['same'], {'item_ids': ['added']}))
     assert [track['setVideoId'] for track in playlist.tracks] == ['original', 'manually-added']
+
+
+def test_direct_transfer_then_undo_keeps_prior_library(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, 'DB_PATH', tmp_path / 'music.db')
+    monkeypatch.setattr(db, 'settings', type('Settings', (), {'data_dir': tmp_path})())
+    db.init_db()
+    monkeypatch.setattr(direct, 'ENABLED', True)
+    monkeypatch.setattr(direct, 'persist', lambda *_: None)
+    monkeypatch.setattr(direct, '_local_match', lambda source, target, track: (track.source_id, 'reviewed', None))
+    playlist = Item('owned_playlist', 'source-list', 'Road trip', kind='playlist',
+                    raw={'owned_by_me': True})
+    existing = Item('owned_playlist', 'existing-list', 'Road trip', kind='playlist')
+    liked = {'prior'}
+    tracks = ['prior']
+    monkeypatch.setitem(direct.FETCHERS, 'spotify', AsyncMock(return_value={
+        'liked': [Item('liked', 'prior', 'Prior'), Item('liked', 'new', 'New')],
+        'owned_playlist': [playlist],
+        'playlist:source-list': [Item('playlist:source-list', 'prior', 'Prior'),
+                                 Item('playlist:source-list', 'new', 'New')],
+    }))
+
+    async def fetch_target():
+        return {'liked': [Item('liked', value, value) for value in liked],
+                'owned_playlist': [existing]}
+
+    monkeypatch.setitem(direct.FETCHERS, 'ytmusic', fetch_target)
+
+    class Destination:
+        async def account(self):
+            return '@channel'
+
+        async def apply_likes(self, ids, journal):
+            for value in ids:
+                assert value not in liked
+                operation = journal.record('likes', [value])
+                liked.add(value)
+                journal.confirm(operation)
+
+        async def playlist_tracks(self, playlist_id):
+            assert playlist_id == 'existing-list'
+            return tracks.copy()
+
+        async def append(self, playlist_id, ids):
+            tracks.extend(ids)
+            return ['entry-' + value for value in ids]
+
+        async def undo_likes(self, ids):
+            liked.difference_update(ids)
+
+        async def undo_playlist(self, playlist_id, ids, guard):
+            assert guard['item_ids'] == ['entry-new']
+            for value in ids:
+                tracks.remove(value)
+            return True
+
+    @asynccontextmanager
+    async def fake_destination(target):
+        assert target == 'ytmusic'
+        yield Destination()
+
+    monkeypatch.setattr(direct, 'destination_client', fake_destination)
+    monkeypatch.setattr(direct, '_task', None)
+
+    async def scenario():
+        direct.save_rule('spotify', 'ytmusic', True)
+        first = direct.submit('spotify', 'ytmusic')
+        await direct._task
+        assert direct.status()['job']['state'] == 'completed'
+        assert liked == {'prior', 'new'} and tracks == ['prior', 'new']
+        direct.submit('spotify', 'ytmusic')
+        await direct._task
+        assert direct.status()['job']['result']['liked_added'] == 0
+        assert tracks == ['prior', 'new']
+        direct.submit_undo(first['job_id'])
+        await direct._task
+        assert direct.status()['job']['state'] == 'completed'
+        assert not direct.rule()['scheduled']
+        assert liked == {'prior'} and tracks == ['prior']
+
+    asyncio.run(scenario())
