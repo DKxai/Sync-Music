@@ -172,7 +172,13 @@ CREATE TABLE IF NOT EXISTS direct_sync_job (
   done INTEGER NOT NULL DEFAULT 0,
   total INTEGER NOT NULL DEFAULT 0,
   result_json TEXT,
+  retry_at INTEGER,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS direct_sync_snapshots (
+  provider TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS direct_playlist_links (

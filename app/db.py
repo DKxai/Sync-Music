@@ -38,6 +38,9 @@ def init_db():
         if 'reason' not in columns:
             con.execute('ALTER TABLE direct_catalog_cache ADD COLUMN reason TEXT')
             con.execute('DELETE FROM direct_catalog_cache WHERE target_id IS NULL')
+        columns = {row['name'] for row in con.execute('PRAGMA table_info(direct_sync_job)')}
+        if 'retry_at' not in columns:
+            con.execute('ALTER TABLE direct_sync_job ADD COLUMN retry_at INTEGER')
 
 def get_setting(name: str):
     with connect() as con:

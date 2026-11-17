@@ -154,12 +154,11 @@ private one. Spotify destinations must be private and non-collaborative.
 Extra destination tracks keep their order. New tracks are appended in source
 order. Providers apply their own timestamps to new likes.
 
-A run looks up up to 120 new tracks and attempts up to 400 additions to Spotify.
-For YouTube Music, the limits are 40 lookups and 200 additions. Each destination
-playlist can receive up to 100 additions per run. Subsequent runs reuse catalog
-results. Spotify rate limits can defer work to the next run. The dashboard
-reports tracks that need a match and playlists that need review. A Spotify
-playlist that needs review does not prevent other playlists from syncing.
+A direct sync works through the full library. Writes are batched, including up
+to 100 tracks per playlist request. On a Spotify rate limit the active run
+waits for `Retry-After`, then continues automatically. After a restart it reuses
+the initial snapshots, saved matches and verified changes. The final dashboard
+summary shows tracks without a match and items or playlists that need review.
 Apple Music remains available for library reads and manual export.
 
 Undo is available for direct transfers that recorded verified additions. Undo

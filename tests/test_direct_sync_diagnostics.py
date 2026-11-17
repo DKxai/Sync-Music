@@ -1,4 +1,5 @@
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -125,18 +126,21 @@ def test_two_way_uses_one_snapshot_per_provider_and_separate_undo_ids(database, 
     asyncio.run(scenario())
 
 
-def test_search_budget_distinguishes_waiting_from_no_match(database, monkeypatch):
-    monkeypatch.setattr(direct, 'MAX_SEARCHES', 1)
+def test_catalog_errors_are_reported_separately_from_unmatched_tracks(database, monkeypatch):
     monkeypatch.setattr(direct, '_local_match', lambda *_: (None, 'unmatched', None))
-    monkeypatch.setattr(direct, '_catalog_match', AsyncMock(return_value=(None, 'not_found')))
+    monkeypatch.setattr(direct, '_catalog_match', AsyncMock(side_effect=[
+        (None, 'not_found'), httpx.ReadTimeout('request timed out'), ('match', None),
+    ]))
     source = {'liked': [Item('liked', 'first', 'No match'),
-                        Item('liked', 'second', 'Not yet searched')], 'owned_playlist': []}
-    result = dict(unmatched=0, search_deferred=0)
+                        Item('liked', 'second', 'Temporary failure'),
+                        Item('liked', 'third', 'Matched after failure')], 'owned_playlist': []}
+    result = dict(unmatched=0, tracks_failed=0)
 
     asyncio.run(direct._plan('job', 'ytmusic', 'spotify', source, None, result))
-    assert result == dict(unmatched=1, search_deferred=1)
+    assert result == dict(unmatched=1, tracks_failed=1)
     assert direct_results.list_items('unmatched', 0, 25)['items'][0]['title'] == 'No match'
-    assert direct_results.list_items('deferred', 0, 25)['items'][0]['title'] == 'Not yet searched'
+    assert direct_results.list_items('failed', 0, 25)['items'][0]['title'] == 'Temporary failure'
+    assert direct_results.list_items('pending', 0, 25)['items'][0]['title'] == 'Matched after failure'
 
 
 def test_catalog_matches_video_metadata_and_equivalent_editions():
@@ -161,25 +165,141 @@ def test_spotify_fallback_results_are_cached(database):
     assert direct._local_match('ytmusic', 'spotify', track)[2]['target_id'] == 'sp1'
 
 
-def test_spotify_rate_limit_defers_lookups_and_writes_without_caching_misses(database):
-    adapter = SpotifyDestination(None)
-    response = httpx.Response(429, request=httpx.Request('GET', f'{spotify.API}/search'))
-    adapter.search = AsyncMock(side_effect=[
-        [('sp1', 'First song', 'Artist', 200000, None)],
-        httpx.HTTPStatusError('rate limited', request=response.request, response=response),
-    ])
-    adapter.account = AsyncMock()
-    source = {'liked': [Item('liked', key, title, artist='Artist', duration_ms=200000)
-                        for key, title in [('yt1', 'First song'), ('yt2', 'Second song'), ('yt3', 'Third song')]],
-              'owned_playlist': []}
-    result = dict(unmatched=0, search_deferred=0, writes_deferred=0)
-    asyncio.run(direct._apply('job', 'ytmusic', 'spotify', source, {}, adapter, result))
+@pytest.mark.parametrize('restart_during_wait', [None, 'likes', 'playlist'])
+def test_sync_passes_old_limits_and_continues_after_spotify_wait(database, monkeypatch, restart_during_wait):
+    liked = [Item('liked', f'yt{index}', f'Song {index}', artist='Artist', duration_ms=200000)
+             for index in range(521)]
+    source = {'liked': liked, 'owned_playlist': [Item('owned_playlist', 'source-list', 'Road trip', kind='playlist')],
+              'playlist:source-list': [Item('playlist:source-list', item.remote_id, item.title,
+                                            raw={'track_id': item.remote_id}) for item in liked[:205]]}
+    target = {'liked': [], 'owned_playlist': []}
+    monkeypatch.setattr(spotify, 'access_token', AsyncMock(return_value='test'))
+    monkeypatch.setattr(direct, 'persist', lambda *_: None)
+    read_source = AsyncMock(return_value=source)
+    read_target = AsyncMock(return_value=target)
+    monkeypatch.setattr(direct, 'FETCHERS', {'ytmusic': read_source, 'spotify': read_target})
+    searches, remote_likes, playlist, playlist_batches = [], set(), [], []
+    playlist_version = 0
+    limit_search, limit_write = True, True
+    limit_verify = restart_during_wait == 'playlist'
 
-    assert result == dict(unmatched=0, search_deferred=2, writes_deferred=1, spotify_rate_limited=True)
-    assert direct_results.list_items('deferred', 0, 25)['total'] == 3
-    with db.connect() as con:
-        assert [row['source_id'] for row in con.execute('SELECT source_id FROM direct_catalog_cache')] == ['yt1']
-    adapter.account.assert_not_awaited()
+    def send(request):
+        nonlocal limit_search, limit_write, limit_verify, playlist_version
+        path = request.url.path
+        if path == '/v1/search':
+            _, index, _ = request.url.params['q'].split()
+            if index == '3' and limit_search:
+                limit_search = False
+                return httpx.Response(429, headers={'Retry-After': '12'})
+            searches.append(index)
+            if index == '15':
+                return httpx.Response(400)
+            return httpx.Response(200, json={'tracks': {'items': [
+                {'id': f'sp{index}', 'name': f'Song {index}', 'artists': [{'name': 'Artist'}], 'duration_ms': 200000},
+            ]}})
+        if path == '/v1/me':
+            return httpx.Response(200, json={'id': 'owner'})
+        if path.startswith('/v1/me/library'):
+            ids = [uri.split(':')[-1] for uri in request.url.params['uris'].split(',')]
+            assert len(ids) <= 40
+            if path.endswith('/contains'):
+                return httpx.Response(200, json=[value in remote_likes for value in ids])
+            if request.method == 'DELETE':
+                remote_likes.difference_update(ids)
+                return httpx.Response(200)
+            assert request.method == 'PUT'
+            if len(remote_likes) == 40 and limit_write:
+                limit_write = False
+                return httpx.Response(429, headers={'Retry-After': '90'})
+            assert remote_likes.isdisjoint(ids)
+            remote_likes.update(ids)
+            return httpx.Response(200)
+        if path == '/v1/me/playlists':
+            assert request.method == 'POST'
+            assert playlist_version == 0
+            playlist_version += 1
+            return httpx.Response(201, json={'id': 'target-list'})
+        if path.endswith('/target-list'):
+            if limit_verify and len(playlist) == 100:
+                limit_verify = False
+                return httpx.Response(429, headers={'Retry-After': '45'})
+            return httpx.Response(200, json={'owner': {'id': 'owner'}, 'public': False,
+                                             'snapshot_id': str(playlist_version)})
+        assert path.endswith('/target-list/items')
+        if request.method == 'POST':
+            ids = [uri.split(':')[-1] for uri in json.loads(request.content)['uris']]
+            playlist_batches.append(len(ids))
+            playlist.extend(ids)
+            playlist_version += 1
+            return httpx.Response(201, json={'snapshot_id': str(playlist_version)})
+        if request.method == 'DELETE':
+            data = json.loads(request.content)
+            assert data['snapshot_id'] == str(playlist_version)
+            ids = {item['uri'].split(':')[-1] for item in data['items']}
+            playlist[:] = [value for value in playlist if value not in ids]
+            playlist_version += 1
+            return httpx.Response(200, json={'snapshot_id': str(playlist_version)})
+        offset = int(request.url.params['offset'])
+        return httpx.Response(200, json={'items': [{'item': {'id': value}} for value in playlist[offset:offset + 50]],
+                                         'next': 'next' if len(playlist) > offset + 50 else None})
+
+    @asynccontextmanager
+    async def fake_destination(_):
+        async with httpx.AsyncClient(transport=httpx.MockTransport(send)) as http:
+            yield SpotifyDestination(http)
+
+    monkeypatch.setattr(direct, 'destination_client', fake_destination)
+
+    async def scenario():
+        waiting = asyncio.Event()
+        deadlines = []
+
+        async def inspect_wait(job_id, retry_at):
+            job = direct.status()['job']
+            assert job['job_id'] == job_id and job['retry_at'] == retry_at
+            deadlines.append(retry_at - direct.time.time())
+            if (restart_during_wait == 'likes' and len(deadlines) == 2
+                    or restart_during_wait == 'playlist' and len(deadlines) == 3):
+                waiting.set()
+                await asyncio.Future()
+            with db.connect() as con:
+                con.execute('UPDATE direct_sync_job SET retry_at=NULL WHERE job_id=?', (job_id,))
+
+        monkeypatch.setattr(direct, '_wait_until', inspect_wait)
+        started = direct.submit('ytmusic', 'spotify')
+        if restart_during_wait:
+            await asyncio.wait_for(waiting.wait(), timeout=10)
+            await direct.shutdown()
+            assert direct.status()['job']['result']['liked_added'] == (40 if restart_during_wait == 'likes' else 520)
+            direct.recover()
+        await direct._task
+        job = direct.status()['job']
+
+        assert job['job_id'] == started['job_id'] and job['retry_at'] is None
+        assert job['state'] == 'partial' and job['stage'] == 'finished'
+        assert job['result']['liked_added'] == len(remote_likes) == 520
+        assert job['result']['playlist_tracks_added'] == 204
+        assert job['result']['tracks_failed'] == 2
+        assert 11 <= deadlines[0] <= 13 and 89 <= deadlines[1] <= 91
+        assert len(deadlines) == {None: 2, 'likes': 3, 'playlist': 4}[restart_during_wait]
+        assert playlist_batches == [100, 100, 4]
+        assert playlist == [f'sp{index}' for index in range(205) if index != 15]
+        failed = direct_results.list_items('failed', 0, 25)['items']
+        assert {row['title'] for row in failed} == {'Song 15'}
+        assert all('HTTP 400' in row['reason'] for row in failed)
+        assert searches.count('3') == 1  # successful matches survive a restart
+        assert undo.history()[0]['uncertain'] == 0  # a rejected 429 never becomes an undo entry
+        read_source.assert_awaited_once()
+        read_target.assert_awaited_once()
+        with db.connect() as con:
+            assert con.execute('SELECT COUNT(*) FROM direct_sync_snapshots').fetchone()[0] == 0
+
+        direct.submit_undo(started['job_id'])
+        await direct._task
+        assert direct.status()['job']['state'] == 'completed'
+        assert not remote_likes and not playlist
+
+    asyncio.run(scenario())
 
 
 def test_spotify_playlist_failure_does_not_stop_other_playlists(database, monkeypatch):
@@ -214,7 +334,7 @@ def test_spotify_playlist_failure_does_not_stop_other_playlists(database, monkey
             return httpx.Response(201, json={'snapshot_id': 'added'})
         return httpx.Response(200, json={'items': [{'item': {'id': value}} for value in tracks], 'next': None})
 
-    result = dict(unmatched=0, search_deferred=0, writes_deferred=0, playlist_tracks_added=0, playlists_need_review=0)
+    result = dict(unmatched=0, tracks_failed=0, playlist_tracks_added=0, playlists_need_review=0)
 
     async def go():
         async with httpx.AsyncClient(transport=httpx.MockTransport(send)) as http:

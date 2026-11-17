@@ -5,6 +5,7 @@ from contextlib import contextmanager
 
 import httpx
 
+from ..connectors import spotify
 from ..db import connect
 
 
@@ -45,6 +46,18 @@ class Journal:
         self.account = account
         self.stats = stats
 
+    def restore_counts(self):
+        with connect() as con:
+            rows = con.execute(
+                'SELECT kind,account,ids_json,status FROM direct_sync_undo WHERE job_id=?', (self.job_id,),
+            )
+            for row in rows:
+                if row['account'] != self.account:
+                    raise ValueError('Tài khoản đích đã thay đổi. Kết nối lại tài khoản đã bắt đầu lượt đồng bộ.')
+                if row['status'] == 'confirmed':
+                    key = 'liked_added' if row['kind'] == 'likes' else 'playlist_tracks_added'
+                    self.stats[key] += len(json.loads(row['ids_json']))
+
     def record(self, kind, ids, playlist_id=None, guard=None):
         with connect() as con:
             return con.execute(
@@ -55,6 +68,19 @@ class Journal:
                  json.dumps(ids), json.dumps(guard or {})),
             ).lastrowid
 
+    def pending(self, kind, playlist_id=None):
+        with connect() as con:
+            rows = con.execute(
+                """SELECT id,ids_json,guard_json FROM direct_sync_undo
+                   WHERE job_id=? AND kind=? AND playlist_id IS ? AND status='pending'""",
+                (self.job_id, kind, playlist_id),
+            ).fetchall()
+        return [(row['id'], json.loads(row['ids_json']), json.loads(row['guard_json'])) for row in rows]
+
+    def checkpoint(self, entry, guard):
+        with connect() as con:
+            con.execute('UPDATE direct_sync_undo SET guard_json=? WHERE id=?', (json.dumps(guard), entry))
+
     @contextmanager
     def attempt(self, entry):
         try:
@@ -64,6 +90,17 @@ class Journal:
                 with connect() as con:
                     con.execute("DELETE FROM direct_sync_undo WHERE id=? AND status='pending'", (entry,))
             raise
+
+    async def write_playlist(self, playlist_id, ids, append, before_retry):
+        while True:
+            entry = self.record('playlist', ids, playlist_id)
+            try:
+                with self.attempt(entry):
+                    return entry, await append(playlist_id, ids)
+            except httpx.HTTPStatusError as exc:
+                if not await spotify.wait_after_rate_limit(exc.response):
+                    raise
+                await before_retry()
 
     def confirm(self, entry, guard=None):
         with connect() as con:
@@ -92,7 +129,10 @@ async def reverse(run_id, adapter, result, report):
             likes.append((row['id'], ids))
             continue
         else:
-            guard = json.loads(row['guard_json'])
+            # Undoing a newer batch can advance the guard of the preceding batch.
+            with connect() as con:
+                saved = con.execute('SELECT guard_json FROM direct_sync_undo WHERE id=?', (row['id'],)).fetchone()
+            guard = json.loads(saved['guard_json'])
             try:
                 restored = await adapter.undo_playlist(row['playlist_id'], ids, guard)
             except httpx.HTTPStatusError as exc:
