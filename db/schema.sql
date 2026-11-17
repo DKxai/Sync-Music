@@ -149,3 +149,61 @@ CREATE TABLE IF NOT EXISTS library_export_order (
   remote_id TEXT NOT NULL,
   PRIMARY KEY(provider,position)
 );
+
+CREATE TABLE IF NOT EXISTS dashboard_sessions (
+  token_hash TEXT PRIMARY KEY,
+  expires_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS direct_sync_rule (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  source TEXT NOT NULL,
+  target TEXT NOT NULL,
+  scheduled INTEGER NOT NULL CHECK(scheduled IN (0,1))
+);
+
+CREATE TABLE IF NOT EXISTS direct_sync_job (
+  id INTEGER PRIMARY KEY CHECK(id=1),
+  job_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  target TEXT NOT NULL,
+  state TEXT NOT NULL,
+  stage TEXT NOT NULL,
+  done INTEGER NOT NULL DEFAULT 0,
+  total INTEGER NOT NULL DEFAULT 0,
+  result_json TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS direct_playlist_links (
+  source TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  target TEXT NOT NULL,
+  target_id TEXT,
+  PRIMARY KEY(source,source_id,target),
+  UNIQUE(target,target_id)
+);
+
+CREATE TABLE IF NOT EXISTS direct_catalog_cache (
+  source TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  target TEXT NOT NULL,
+  target_id TEXT,
+  expires_at INTEGER NOT NULL,
+  PRIMARY KEY(source,source_id,target)
+);
+
+CREATE TABLE IF NOT EXISTS direct_sync_undo (
+  id INTEGER PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  target TEXT NOT NULL,
+  account TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('likes','playlist')),
+  playlist_id TEXT,
+  ids_json TEXT NOT NULL,
+  guard_json TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','confirmed','reverted')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS direct_sync_undo_job_idx ON direct_sync_undo(job_id,id);
