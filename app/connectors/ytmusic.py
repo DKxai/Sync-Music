@@ -98,7 +98,9 @@ def _read(stage, method, *args, **kwargs):
         raise ImportRequestError(f'YouTube Music {stage}: {detail}') from None
     except json.JSONDecodeError:
         raise ImportRequestError(f'YouTube Music {stage}: invalid JSON') from None
-    except KeyError:
+    except ImportRequestError:
+        raise
+    except (KeyError, IndexError):
         raise ImportRequestError(f'YouTube Music {stage}: response missing expected data') from None
     except ValueError:
         raise ImportRequestError(f'YouTube Music {stage}: invalid data') from None
@@ -117,14 +119,60 @@ async def call(stage, method, *args, **kwargs):
             raise ProviderResponseError(f'YouTube Music không trả đủ dữ liệu khi {stage}.') from None
 
 
+def _liked_shelf(api, limit):
+    """Read the LM track shelf independently of optional playlist header metadata."""
+    from ytmusicapi.continuations import CONTINUATION_ITEMS, get_continuation_token
+    from ytmusicapi.navigation import SINGLE_COLUMN_TAB, TWO_COLUMN_RENDERER, nav
+    from ytmusicapi.parsers.playlists import parse_playlist_items
+
+    invalid = 'YouTube Music trả về danh sách bài đã thích chưa đầy đủ. Hãy kiểm tra kết nối rồi nhập lại.'
+    response = api._send_request('browse', {'browseId': 'VLLM'})
+    shelves = []
+    for path in (TWO_COLUMN_RENDERER + ['secondaryContents'], SINGLE_COLUMN_TAB):
+        sections = nav(response, path + ['sectionListRenderer', 'contents'], True) or []
+        shelves.extend(section['musicPlaylistShelfRenderer'] for section in sections
+                       if 'musicPlaylistShelfRenderer' in section)
+    if len(shelves) != 1 or shelves[0].get('continuations'):
+        raise ImportRequestError(invalid)
+    rows = shelves[0].get('contents')
+    tracks = []
+    seen = set()
+    while isinstance(rows, list):
+        more = bool(rows and isinstance(rows[-1], dict) and 'continuationItemRenderer' in rows[-1])
+        entries = rows[:-1] if more else rows
+        if any(not isinstance(row, dict) or 'musicResponsiveListItemRenderer' not in row for row in entries):
+            break
+        page = parse_playlist_items(entries)
+        if len(page) != len(entries):
+            break
+        tracks.extend(page)
+        if not more or (limit is not None and len(tracks) >= limit):
+            return tracks
+        token = get_continuation_token(rows)
+        if not token or token in seen:
+            break
+        seen.add(token)
+        response = api._send_request('browse', {'continuation': token})
+        rows = nav(response, CONTINUATION_ITEMS, True)
+    raise ImportRequestError(invalid)
+
+
+def liked_tracks(api, limit=None):
+    try:
+        result = api.get_liked_songs(limit=limit)
+    except (KeyError, IndexError):
+        return _read('read liked songs', _liked_shelf, api, limit)
+    if not isinstance(result, dict) or not isinstance(result.get('tracks'), list):
+        raise ImportRequestError('YouTube Music read liked songs: missing or invalid tracks list')
+    return result['tracks']
+
+
 def _fetch_sync():
     api = _read('initialize client', client)
-    likes = _read('read liked songs', api.get_liked_songs, limit=None)
-    if not isinstance(likes, dict) or not isinstance(likes.get('tracks'), list):
-        raise ImportRequestError('YouTube Music read liked songs: missing or invalid tracks list')
+    likes = _read('read liked songs', liked_tracks, api)
     out={'liked':[], 'followed_artist':[], 'owned_playlist':[]}
     liked_ids = set()
-    for pos, t in enumerate(likes['tracks']):
+    for pos, t in enumerate(likes):
         video_id = t.get('videoId')
         if not video_id:
             out['liked'].append(unavailable('liked', pos, t))
@@ -166,10 +214,7 @@ def _contains_sync(scope: str, remote_id: str) -> bool:
     api = client()
     limit = 100000
     if scope == 'liked':
-        result = api.get_liked_songs(limit=limit)
-        if not isinstance(result, dict) or not isinstance(result.get('tracks'), list):
-            raise ValueError('YouTube Music library check returned an unexpected response')
-        rows = result['tracks']
+        rows = liked_tracks(api, limit)
         key = 'videoId'
     else:
         rows = api.get_library_subscriptions(limit=limit)

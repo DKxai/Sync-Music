@@ -137,7 +137,14 @@ def provider_ready(provider: str) -> bool:
     if provider == 'ytmusic':
         return settings.ytm_auth_path.is_file() or (google_oauth.configured() and has_token('ytmusic'))
     if provider == 'apple':
-        return apple.developer_configured() and (settings.apple_user_token_path.is_file() or has_token('apple'))
+        if not apple.developer_configured():
+            return False
+        if has_token('apple'):
+            return True
+        try:
+            return bool(settings.apple_user_token_path.read_text().strip())
+        except (OSError, UnicodeError):
+            return False
     return bool(settings.spotify_client_id and settings.spotify_redirect_uri and has_token('spotify'))
 
 def direct_schedule_ready(rule):
@@ -369,6 +376,8 @@ async def sync_all():
 
 @app.post('/v1/sync/{provider}', status_code=202, dependencies=[Depends(admin)])
 async def sync_now(provider: Literal['spotify', 'ytmusic', 'apple']):
+    if not provider_ready(provider):
+        raise HTTPException(409, "Hãy kết nối dịch vụ trước khi nhập thư viện.")
     return submit(provider)
 
 @app.post('/v1/baseline/approve', dependencies=[Depends(admin)])

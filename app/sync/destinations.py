@@ -271,10 +271,8 @@ class YouTubeDestination:
             raise ValueError('YouTube Music could not verify removed likes.')
 
     async def liked_ids(self):
-        data = await ytmusic.call('đọc lượt thích', self.api.get_liked_songs, limit=None)
-        if not isinstance(data.get('tracks'), list):
-            raise ValueError('YouTube Music liked tracks could not be verified.')
-        return {item.get('videoId') for item in data['tracks']}
+        tracks = await ytmusic.call('đọc lượt thích', ytmusic.liked_tracks, self.api)
+        return {item.get('videoId') for item in tracks}
 
     async def undo_playlist(self, playlist_id, ids, guard):
         tracks = await self._playlist_rows(playlist_id)
