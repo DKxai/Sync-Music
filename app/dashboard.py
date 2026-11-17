@@ -22,7 +22,7 @@ button.primary{background:var(--accent);border-color:transparent;color:var(--dar
 :focus-visible{outline:2px solid var(--accent);outline-offset:3px}
 input:not([type="checkbox"]){width:min(100%,420px)}input[type="checkbox"]{min-height:auto;accent-color:#90daba;width:18px;height:18px}
 label.inline,.flex{display:flex;flex-wrap:wrap;gap:10px;align-items:center}.flex{margin:12px 0}
-label.choose{display:grid;gap:6px;max-width:335px;margin:16px 0}label.choose select{max-width:100%}
+label.choose{display:grid;grid-template-columns:minmax(0,1fr);gap:6px;max-width:335px;margin:16px 0}label.choose select{width:100%;min-width:0;max-width:100%}
 .jobbox{padding:15px;background:var(--surface);border-radius:12px;margin-top:16px}.jobbox p:last-child,.provider p:last-child{margin-bottom:0}
 progress{width:100%;height:10px;accent-color:var(--accent);vertical-align:middle}
 a{color:var(--accent)}summary{cursor:pointer;font-weight:650}details[open] summary{margin-bottom:12px}
