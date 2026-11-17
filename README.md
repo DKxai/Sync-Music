@@ -143,9 +143,12 @@ YouTube Music browser configuration can be reused. Keep the same persistent
 uses a secure HTTPS cookie valid for 14 days. Existing API clients can continue
 to send `X-API-Key`.
 
-Choose Spotify → YouTube Music or YouTube Music → Spotify. Use **Đồng bộ ngay**
-for a single transfer or save the schedule to repeat that direction every ten
-minutes. Native likes and playlist tracks are copied separately. For an owned
+Choose Spotify → YouTube Music, YouTube Music → Spotify, or a two-way transfer.
+Two-way mode reads each library once and copies additions in both directions from
+those initial snapshots. Removing a track from just one service does not remove it
+from the other and a later run may restore it. Use **Đồng bộ ngay** or save a
+schedule to repeat the selected mode every ten minutes. The dashboard provides
+paginated track results and reasons for the latest transfer. Native likes and playlist tracks are copied separately. For an owned
 playlist, Sync-Music links an unambiguous same-name eligible playlist or creates a
 private one. Spotify destinations must be private and non-collaborative.
 Extra destination tracks keep their order. New tracks are appended in source

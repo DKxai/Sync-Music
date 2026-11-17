@@ -20,7 +20,7 @@ from .dashboard import HTML
 from .dashboard_session import admin, router as dashboard_session_router
 from .provider_tokens import has_token
 from .sync.engine import POLL_LOCK, poll
-from .sync import direct, review, transfer, writer
+from .sync import direct, direct_results, review, transfer, writer
 
 PROVIDERS = ('spotify', 'ytmusic', 'apple')
 scheduler = AsyncIOScheduler(timezone='UTC')
@@ -79,7 +79,9 @@ def provider_ready(provider: str) -> bool:
 
 async def scheduled_direct_sync():
     rule = direct.rule()
-    if rule and rule['scheduled'] and all(provider_ready(rule[key]) for key in ('source', 'target')):
+    if rule and rule['scheduled'] and direct.directions(rule['source'], rule['target']) and all(
+        provider_ready(provider) for provider in direct.SERVICES
+    ):
         direct.submit(rule['source'], rule['target'])
 
 
@@ -140,8 +142,8 @@ def config():
             'spotify_oauth_configured': bool(settings.spotify_client_id and settings.spotify_redirect_uri)}
 
 class DirectDirection(BaseModel):
-    source: Literal['spotify', 'ytmusic']
-    target: Literal['spotify', 'ytmusic']
+    source: Literal['spotify', 'ytmusic', 'both']
+    target: Literal['spotify', 'ytmusic', 'both']
 
 
 class DirectRule(DirectDirection):
@@ -151,9 +153,9 @@ class DirectRule(DirectDirection):
 def validate_direction(direction):
     if not direct.ENABLED:
         raise HTTPException(409, 'Enable AUTO_TRANSFER_ENABLED on the server.')
-    if direction.source == direction.target:
-        raise HTTPException(422, 'Choose two different services.')
-    if not all(provider_ready(provider) for provider in (direction.source, direction.target)):
+    if not direct.directions(direction.source, direction.target):
+        raise HTTPException(422, 'Choose a valid sync direction.')
+    if not all(provider_ready(provider) for provider in direct.SERVICES):
         raise HTTPException(409, 'Connect both music services first.')
 
 
@@ -162,12 +164,21 @@ def direct_status():
     return direct.status()
 
 
+@app.get('/v1/direct-sync/items', dependencies=[Depends(admin)])
+def direct_items(
+    status: Literal['pending', 'deferred', 'unmatched', 'failed', 'synced'] | None = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(25, ge=1, le=100),
+):
+    return direct_results.list_items(status, offset, limit)
+
+
 @app.put('/v1/direct-sync/rule', dependencies=[Depends(admin)])
 def direct_rule(payload: DirectRule):
     if payload.scheduled:
         validate_direction(payload)
-    elif payload.source == payload.target:
-        raise HTTPException(422, 'Choose two different services.')
+    elif not direct.directions(payload.source, payload.target):
+        raise HTTPException(422, 'Choose a valid sync direction.')
     direct.save_rule(payload.source, payload.target, payload.scheduled)
     return direct.status()
 

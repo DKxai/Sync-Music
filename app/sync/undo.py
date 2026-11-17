@@ -1,10 +1,15 @@
 """Journal verified additions and undo the latest transfer for each destination."""
 import hashlib
 import json
+from contextlib import contextmanager
 
 import httpx
 
 from ..db import connect
+
+
+def rejected_write(exc):
+    return isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (400, 401, 403, 404, 429)
 
 
 def fingerprint(ids):
@@ -19,6 +24,17 @@ def history():
                FROM direct_sync_undo WHERE status!='reverted'
                GROUP BY job_id,source,target ORDER BY MAX(id) DESC LIMIT 20"""
         ).fetchall()]
+
+
+def resolve_absent_spotify_likes(account, current_likes):
+    with connect() as con:
+        rows = con.execute(
+            """SELECT id,ids_json FROM direct_sync_undo
+               WHERE target='spotify' AND account=? AND kind='likes' AND status='pending'
+               ORDER BY id DESC LIMIT 100""", (account,),
+        ).fetchall()
+        absent = [(row['id'],) for row in rows if current_likes.isdisjoint(json.loads(row['ids_json']))]
+        con.executemany("UPDATE direct_sync_undo SET status='reverted' WHERE id=?", absent)
 
 
 class Journal:
@@ -38,6 +54,16 @@ class Journal:
                 (self.job_id, self.source, self.target, self.account, kind, playlist_id,
                  json.dumps(ids), json.dumps(guard or {})),
             ).lastrowid
+
+    @contextmanager
+    def attempt(self, entry):
+        try:
+            yield
+        except httpx.HTTPStatusError as exc:
+            if rejected_write(exc):
+                with connect() as con:
+                    con.execute("DELETE FROM direct_sync_undo WHERE id=? AND status='pending'", (entry,))
+            raise
 
     def confirm(self, entry, guard=None):
         with connect() as con:
