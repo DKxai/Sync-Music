@@ -1,6 +1,6 @@
 # Music Sync Hub (self-hosted / single user)
 
-Version **0.3.0** supports scheduled snapshots, manual Sync Now, Spotify OAuth, Google device authorization for YouTube Music, and MusicKit user authorization. The reviewed additions writer can add mapped liked tracks and followed artists between Spotify and YouTube Music. Its default is off. See [Botkeep setup](docs/BOTKEEP.md) for current setup and release scope.
+Version **0.4.0** supports scheduled snapshots, manual Sync Now, Spotify OAuth, Google device authorization for YouTube Music, and MusicKit user authorization. The reviewed additions writer can add mapped liked tracks and followed artists between Spotify and YouTube Music. Its default is off. See [Botkeep setup](docs/BOTKEEP.md) for current setup and release scope.
 
 ## 1. Requirements
 
@@ -133,3 +133,35 @@ python3 -m pytest -q tests
 ## Botkeep Cloud (native Python, no Docker)
 
 Use `python main.py` as Botkeep start command. The launcher reads Botkeep's `SERVER_PORT` and managed `.env`, creates a single Uvicorn worker, and uses `data/` for SQLite by default. See [Botkeep deployment guide](docs/BOTKEEP.md). Docker Compose is for separate Docker-capable servers only.
+
+### Direct transfers and undo
+
+Set `AUTO_TRANSFER_ENABLED=true` on Botkeep and redeploy from `main`. Then connect
+Spotify again from the dashboard to grant the additional scopes. The existing
+YouTube Music browser configuration can be reused. Keep the same persistent
+`DATA_DIR` and `ENCRYPTION_KEY` when updating the server. The dashboard sign-in
+uses a secure HTTPS cookie valid for 14 days. Existing API clients can continue
+to send `X-API-Key`.
+
+Choose Spotify → YouTube Music or YouTube Music → Spotify. Use **Đồng bộ ngay**
+for a single transfer or save the schedule to repeat that direction every ten
+minutes. Native likes and playlist tracks are copied separately. For an owned
+playlist, Sync-Music links an unambiguous same-name eligible playlist or creates a
+private one. Spotify destinations must be private and non-collaborative.
+Extra destination tracks keep their order. New tracks are appended in source
+order. Providers apply their own timestamps to new likes.
+
+A run searches for up to 40 tracks and attempts up to 200 additions, with up to
+100 additions to any one playlist. Large libraries may need several runs.
+Tracks without a unique match and ambiguous playlists are reported in the
+dashboard. Apple Music remains available for library reads and manual export.
+
+Undo is available for direct transfers that recorded verified additions. Undo
+processes the latest outstanding run per destination and pauses the schedule.
+It removes verified new likes and playlist entries. Playlists created during
+the run are retained. Spotify skips playlists whose snapshot changed or where
+a newly added Spotify track duplicates an older occurrence. YouTube Music
+uses individual playlist item IDs to remove only the new occurrences. Its
+native undo clears the like to neutral. A previous dislike is not restored.
+An unconfirmed provider response is reported for manual review. Earlier
+manual imports have no undo journal.

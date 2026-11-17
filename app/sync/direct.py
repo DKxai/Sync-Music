@@ -4,13 +4,15 @@ import json
 import os
 import re
 import time
-from collections import Counter
+from contextlib import asynccontextmanager
 from uuid import uuid4
 
 import httpx
 
 from ..connectors import spotify, ytmusic
+from ..connectors.base import Item
 from ..db import connect
+from . import undo
 from .destinations import SpotifyDestination, YouTubeDestination, missing_occurrences
 from .engine import FETCHERS, POLL_LOCK, persist
 from .matcher import preview_score
@@ -27,11 +29,16 @@ _task = None
 def status():
     with connect() as con:
         job = con.execute('SELECT * FROM direct_sync_job WHERE id=1').fetchone()
-        rule = con.execute('SELECT source,target,scheduled FROM direct_sync_rule WHERE id=1').fetchone()
     job = dict(job) if job else None
     if job:
         job['result'] = json.loads(job.pop('result_json') or '{}')
-    return {'enabled': ENABLED, 'job': job, 'rule': dict(rule) if rule else None}
+    return {'enabled': ENABLED, 'job': job, 'rule': rule(), 'history': undo.history()}
+
+
+def rule():
+    with connect() as con:
+        row = con.execute('SELECT source,target,scheduled FROM direct_sync_rule WHERE id=1').fetchone()
+    return dict(row) if row else None
 
 
 def save_rule(source, target, scheduled):
@@ -98,13 +105,13 @@ def _local_match(source, target, track):
 
 async def _catalog_match(adapter, source, target, track):
     results = await adapter.search(track)
-    strong = {
+    results = [row for row in results if REMOTE_ID.fullmatch(row[0])]
+    exact_codes = {candidate_id for candidate_id, _, _, _, isrc in results
+                   if track.isrc and isrc == track.isrc}
+    strong = exact_codes or {
         candidate_id for candidate_id, title, artist, duration, isrc in results
-        if REMOTE_ID.fullmatch(candidate_id) and (
-            (track.isrc and isrc == track.isrc)
-            or (not (track.isrc and isrc and track.isrc != isrc)
-                and preview_score(track.title, track.artist, track.duration_ms, title, artist, duration) == 1)
-        )
+        if not (track.isrc and isrc and track.isrc != isrc)
+        and preview_score(track.title, track.artist, track.duration_ms, title, artist, duration) == 1
     }
     match = next(iter(strong)) if len(strong) == 1 else None
     with connect() as con:
@@ -120,6 +127,7 @@ async def _catalog_match(adapter, source, target, track):
 def _owned_playlist(item, target):
     return target == 'ytmusic' or (
         item.raw.get('owned_by_me') is True and item.raw.get('public') is False
+        and not item.raw.get('collaborative')
     )
 
 
@@ -148,25 +156,28 @@ async def _playlist_id(adapter, source, target, playlist, destination):
     if previous and previous['target_id']:
         return previous['target_id'] if any(
             item.remote_id == previous['target_id'] and _owned_playlist(item, target)
+            and REMOTE_ID.fullmatch(item.remote_id)
             for item in destination
         ) else None
     named = [item for item in destination if item.title.strip() == playlist.title.strip()]
     if named:
-        if len(named) != 1 or not _owned_playlist(named[0], target):
+        if (len(named) != 1 or not _owned_playlist(named[0], target)
+                or not REMOTE_ID.fullmatch(named[0].remote_id)):
             return None
         return named[0].remote_id if _bind(source, target, playlist, named[0].remote_id) else None
     if previous:
         # A timed-out creation may still exist. Never blindly create a second playlist.
         return None
     _bind(source, target, playlist, None)
-    playlist_id = await adapter.create_playlist(playlist.title.strip()[:100])
-    if not REMOTE_ID.fullmatch(playlist_id) or not _bind(source, target, playlist, playlist_id):
+    playlist_id = await adapter.create_playlist(playlist.title.strip())
+    if not isinstance(playlist_id, str) or not REMOTE_ID.fullmatch(playlist_id) or not _bind(source, target, playlist, playlist_id):
         raise ValueError('The destination did not confirm a unique playlist.')
     return playlist_id
 
 
 async def _apply(job_id, source, target, source_data, target_data, adapter, result):
-    playlists = source_data.get('owned_playlist', [])
+    playlists = [playlist for playlist in source_data['owned_playlist']
+                 if source != 'spotify' or playlist.raw.get('owned_by_me') is True]
     collections = [
         (None, source_data.get('liked', [])),
         *((playlist, source_data.get(f'playlist:{playlist.remote_id}', [])) for playlist in playlists),
@@ -206,6 +217,10 @@ async def _apply(job_id, source, target, source_data, target_data, adapter, resu
                 progress(job_id, 'running', 'match_tracks', done, total, result)
         plans.append((playlist, ids))
 
+    account = await adapter.account()
+    if not account:
+        raise ValueError('Cannot identify the destination account for safe undo.')
+    journal = undo.Journal(job_id, source, target, account, result)
     remaining = MAX_MUTATIONS
     target_likes = {item.remote_id for item in target_data.get('liked', [])}
     destination = target_data.get('owned_playlist', [])
@@ -218,8 +233,7 @@ async def _apply(job_id, source, target, source_data, target_data, adapter, resu
             batch = missing[:remaining]
             if batch:
                 # Favorites usually show the most recently added entries first.
-                await adapter.like(list(reversed(batch)))
-            result['liked_added'] += len(batch)
+                await adapter.apply_likes(list(reversed(batch)), journal)
         elif ids and remaining:
             if not playlist.title.strip() or len(playlist.title.strip()) > 100:
                 result['playlists_need_review'] += 1
@@ -229,19 +243,19 @@ async def _apply(job_id, source, target, source_data, target_data, adapter, resu
                 result['playlists_need_review'] += 1
                 continue
             if not any(item.remote_id == playlist_id for item in destination):
-                from ..connectors.base import Item
                 destination.append(Item('owned_playlist', playlist_id, playlist.title, kind='playlist',
                                         raw={'owned_by_me': True, 'public': False}))
-            old = await adapter.playlist_tracks(playlist_id)
+            if target == 'spotify':
+                old, _ = await adapter.playlist_value(playlist_id)
+            else:
+                old = await adapter.playlist_tracks(playlist_id)
             missing = missing_occurrences(ids, old)
-            batch = missing[:remaining]
+            batch = missing[:min(100, remaining)]
             if batch:
-                await adapter.append(playlist_id, batch)
-                # Verify we added exactly that suffix without changing existing order.
-                observed = await adapter.playlist_tracks(playlist_id)
-                if observed != old + batch:
-                    raise ValueError('The destination playlist needs review after writing.')
-            result['playlist_tracks_added'] += len(batch)
+                entry = journal.record('playlist', batch, playlist_id)
+                receipt = await adapter.append(playlist_id, batch)
+                guard = await _playlist_guard(adapter, target, playlist_id, old, batch, receipt)
+                journal.confirm(entry, guard)
         elif ids:
             result['writes_deferred'] += len(ids)
             continue
@@ -250,6 +264,87 @@ async def _apply(job_id, source, target, source_data, target_data, adapter, resu
         remaining -= len(batch)
         result['writes_deferred'] += len(missing) - len(batch)
     progress(job_id, 'running', 'write_collections', len(plans), len(plans), result)
+
+
+async def _playlist_guard(adapter, target, playlist_id, old, added, receipt):
+    if target == 'spotify':
+        observed, snapshot = await adapter.playlist_value(playlist_id)
+        if receipt and snapshot == receipt and observed == old + added:
+            return {'before': undo.fingerprint(old), 'after': undo.fingerprint(observed),
+                    'snapshot': snapshot, 'unique': not set(added).intersection(old)}
+    elif receipt and await adapter.playlist_tracks(playlist_id) == old + added:
+        return {'item_ids': receipt}
+    raise ValueError('The destination playlist needs review after writing.')
+
+
+@asynccontextmanager
+async def destination_client(target):
+    if target == 'spotify':
+        token = await spotify.access_token()
+        async with httpx.AsyncClient(timeout=25, headers={'Authorization': f'Bearer {token}'}) as http:
+            yield SpotifyDestination(http)
+    else:
+        yield YouTubeDestination(await asyncio.to_thread(ytmusic.client))
+
+
+def submit_undo(transfer_id):
+    global _task
+    if not ENABLED:
+        raise ValueError('Enable AUTO_TRANSFER_ENABLED to undo a transfer.')
+    job_id = uuid4().hex
+    with connect() as con:
+        con.execute('BEGIN IMMEDIATE')
+        active = con.execute('SELECT state FROM direct_sync_job WHERE id=1').fetchone()
+        if active and active['state'] in ('queued', 'running'):
+            raise ValueError('Wait for the running direct sync job.')
+        transfer = con.execute(
+            """SELECT source,target FROM direct_sync_undo WHERE job_id=? AND status!='reverted'
+               ORDER BY id DESC LIMIT 1""", (transfer_id,),
+        ).fetchone()
+        if not transfer:
+            raise ValueError('This transfer has no changes left to undo.')
+        latest = con.execute(
+            """SELECT job_id FROM direct_sync_undo WHERE target=? AND status!='reverted'
+               ORDER BY id DESC LIMIT 1""", (transfer['target'],),
+        ).fetchone()
+        if latest['job_id'] != transfer_id:
+            raise ValueError('Undo the newer transfer to this destination first.')
+        con.execute('UPDATE direct_sync_rule SET scheduled=0 WHERE id=1')
+        con.execute('DELETE FROM direct_sync_job WHERE id=1')
+        con.execute(
+            """INSERT INTO direct_sync_job(id,job_id,source,target,state,stage)
+               VALUES (1,?,?,?,'queued','undo')""", (job_id, transfer['source'], transfer['target']),
+        )
+    _task = asyncio.create_task(run_undo(job_id, transfer_id, transfer['target']))
+    return {'job_id': job_id}
+
+
+async def run_undo(job_id, transfer_id, target):
+    result = dict(likes_removed=0, playlist_tracks_removed=0, conflicts=0, uncertain=0)
+    try:
+        async with POLL_LOCK:
+            progress(job_id, 'running', 'undo', result=result)
+            async with destination_client(target) as adapter:
+                await undo.reverse(
+                    transfer_id, adapter, result,
+                    lambda done, total: progress(job_id, 'running', 'undo', done, total, result),
+                )
+        state = 'partial' if result['conflicts'] or result['uncertain'] else 'completed'
+        progress(job_id, state, 'undo_finished', 1, 1, result)
+    except asyncio.CancelledError:
+        progress(job_id, 'interrupted', 'undo', result=result)
+        raise
+    except Exception as exc:
+        result['error'] = _error(exc)
+        progress(job_id, 'failed', 'undo', result=result)
+
+
+def _error(exc):
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f'Provider HTTP {exc.response.status_code}'
+    if type(exc) is ValueError:
+        return str(exc)
+    return f'Direct sync stopped ({type(exc).__name__}).'
 
 
 async def run(job_id, source, target):
@@ -267,22 +362,15 @@ async def run(job_id, source, target):
             if 'liked' not in target_data or 'owned_playlist' not in target_data:
                 raise ValueError('The destination snapshot lacks favorites or playlists.')
             persist(target, target_data)
-            if target == 'spotify':
-                token = await spotify.access_token()
-                async with httpx.AsyncClient(timeout=25, headers={'Authorization': f'Bearer {token}'}) as http:
-                    await _apply(job_id, source, target, source_data, target_data, SpotifyDestination(http), result)
-            else:
-                api = await asyncio.to_thread(ytmusic.client)
-                await _apply(job_id, source, target, source_data, target_data, YouTubeDestination(api), result)
+            async with destination_client(target) as adapter:
+                await _apply(job_id, source, target, source_data, target_data, adapter, result)
         incomplete = any(result[key] for key in ('unmatched', 'writes_deferred', 'playlists_need_review'))
         progress(job_id, 'partial' if incomplete else 'completed', 'finished', 1, 1, result)
     except asyncio.CancelledError:
         progress(job_id, 'interrupted', 'interrupted', result=result)
         raise
     except Exception as exc:
-        current = status()['job']
-        result['error'] = (
-            f'Provider HTTP {exc.response.status_code}' if isinstance(exc, httpx.HTTPStatusError)
-            else f'Direct sync stopped ({type(exc).__name__}).'
-        )
+        with connect() as con:
+            current = con.execute('SELECT stage,done,total FROM direct_sync_job WHERE id=1').fetchone()
+        result['error'] = _error(exc)
         progress(job_id, 'failed', current['stage'], current['done'], current['total'], result)

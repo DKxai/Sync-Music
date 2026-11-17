@@ -56,9 +56,12 @@ def auth_url():
         con.execute('DELETE FROM oauth_states WHERE expires_at < datetime("now")')
         con.execute('INSERT INTO oauth_states(state,verifier_ciphertext,expires_at) VALUES(?,?,?)', (state,_cipher().encrypt(verifier.encode()),expires_at))
     scope = SCOPES
+    direct_transfer = os.getenv('AUTO_TRANSFER_ENABLED', '').lower() == 'true'
+    if settings.write_enabled or direct_transfer:
+        scope += ' user-library-modify'
     if settings.write_enabled:
-        scope += ' user-library-modify user-follow-modify'
-    if os.getenv('PLAYLIST_TRANSFER_ENABLED', '').lower() == 'true':
+        scope += ' user-follow-modify'
+    if direct_transfer or os.getenv('PLAYLIST_TRANSFER_ENABLED', '').lower() == 'true':
         scope += ' playlist-modify-private'
     params = dict(response_type='code',client_id=settings.spotify_client_id,redirect_uri=settings.spotify_redirect_uri,code_challenge_method='S256',code_challenge=challenge,scope=scope,state=state)
     return f'{AUTH}/authorize?{urlencode(params)}'
@@ -144,7 +147,7 @@ async def fetch():
             owner=(p.get('owner') or {}).get('id')
             if owner != my_id and not p.get('collaborative'): continue
             if not p.get('id'): continue
-            out['owned_playlist'].append(Item('owned_playlist',p['id'],p.get('name') or '',kind='playlist',raw={'snapshot_id':p.get('snapshot_id'),'collaborative':p.get('collaborative')}))
+            out['owned_playlist'].append(Item('owned_playlist',p['id'],p.get('name') or '',kind='playlist',raw={'snapshot_id':p.get('snapshot_id'),'collaborative':p.get('collaborative'),'owned_by_me':bool(my_id and owner == my_id),'public':p.get('public')}))
             # Spotify Development Mode 2026: only owned/collaborative items are supported.
             items = await paged(f"{API}/playlists/{p['id']}/items", {'limit':50})
             scope=f"playlist:{p['id']}"

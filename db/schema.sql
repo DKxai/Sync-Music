@@ -192,3 +192,18 @@ CREATE TABLE IF NOT EXISTS direct_catalog_cache (
   expires_at INTEGER NOT NULL,
   PRIMARY KEY(source,source_id,target)
 );
+
+CREATE TABLE IF NOT EXISTS direct_sync_undo (
+  id INTEGER PRIMARY KEY,
+  job_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  target TEXT NOT NULL,
+  account TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK(kind IN ('likes','playlist')),
+  playlist_id TEXT,
+  ids_json TEXT NOT NULL,
+  guard_json TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','confirmed','reverted')),
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS direct_sync_undo_job_idx ON direct_sync_undo(job_id,id);

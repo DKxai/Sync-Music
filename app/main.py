@@ -2,12 +2,11 @@
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-import hmac
 from typing import Literal
 from uuid import uuid4
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 import httpx
@@ -18,9 +17,10 @@ from . import apple_authorization
 from .connectors import apple, google_oauth, spotify
 from .connectors.base import NotConfigured
 from .dashboard import HTML
+from .dashboard_session import admin, router as dashboard_session_router
 from .provider_tokens import has_token
 from .sync.engine import POLL_LOCK, poll
-from .sync import review, transfer, writer
+from .sync import direct, review, transfer, writer
 
 PROVIDERS = ('spotify', 'ytmusic', 'apple')
 scheduler = AsyncIOScheduler(timezone='UTC')
@@ -77,10 +77,17 @@ def provider_ready(provider: str) -> bool:
         return apple.developer_configured() and (settings.apple_user_token_path.is_file() or has_token('apple'))
     return bool(settings.spotify_client_id and settings.spotify_redirect_uri and has_token('spotify'))
 
+async def scheduled_direct_sync():
+    rule = direct.rule()
+    if rule and rule['scheduled'] and all(provider_ready(rule[key]) for key in ('source', 'target')):
+        direct.submit(rule['source'], rule['target'])
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate()
     init_db()
+    direct.recover()
     for provider, minutes in [('spotify', settings.spotify_minutes),
                               ('ytmusic', settings.ytm_minutes),
                               ('apple', settings.apple_minutes)]:
@@ -91,26 +98,28 @@ async def lifespan(app: FastAPI):
     if settings.write_enabled:
         scheduler.add_job(execute_pending, 'interval', minutes=1, id='sync_writer',
                           coalesce=True, max_instances=1, misfire_grace_time=60)
+    if direct.ENABLED:
+        scheduler.add_job(scheduled_direct_sync, 'interval', minutes=10, id='direct_sync',
+                          coalesce=True, max_instances=1, misfire_grace_time=60)
     scheduler.start()
     try:
         yield
     finally:
         scheduler.shutdown(wait=False)
+        await direct.shutdown()
         for task in list(_tasks):
             task.cancel()
         if _tasks:
             await asyncio.gather(*_tasks, return_exceptions=True)
 
-app = FastAPI(title='Music Sync Hub', version='0.3.0', lifespan=lifespan,
+app = FastAPI(title='Music Sync Hub', version='0.4.0', lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url=None)
 
-def admin(x_api_key: str | None = Header(default=None)):
-    if not x_api_key or not hmac.compare_digest(x_api_key, settings.api_key):
-        raise HTTPException(status_code=401, detail='Invalid admin API key')
+app.include_router(dashboard_session_router)
 
 @app.get('/', response_class=HTMLResponse, include_in_schema=False)
 def dashboard():
-    return HTML
+    return HTMLResponse(HTML, headers={'Cache-Control': 'no-store'})
 
 @app.get('/health')
 def health():
@@ -129,6 +138,53 @@ def config():
             'ytmusic_oauth_configured': google_oauth.configured(),
             'apple_oauth_configured': apple_authorization.configured(),
             'spotify_oauth_configured': bool(settings.spotify_client_id and settings.spotify_redirect_uri)}
+
+class DirectDirection(BaseModel):
+    source: Literal['spotify', 'ytmusic']
+    target: Literal['spotify', 'ytmusic']
+
+
+class DirectRule(DirectDirection):
+    scheduled: bool
+
+
+def validate_direction(direction):
+    if not direct.ENABLED:
+        raise HTTPException(409, 'Enable AUTO_TRANSFER_ENABLED on the server.')
+    if direction.source == direction.target:
+        raise HTTPException(422, 'Choose two different services.')
+    if not all(provider_ready(provider) for provider in (direction.source, direction.target)):
+        raise HTTPException(409, 'Connect both music services first.')
+
+
+@app.get('/v1/direct-sync', dependencies=[Depends(admin)])
+def direct_status():
+    return direct.status()
+
+
+@app.put('/v1/direct-sync/rule', dependencies=[Depends(admin)])
+def direct_rule(payload: DirectRule):
+    if payload.scheduled:
+        validate_direction(payload)
+    elif payload.source == payload.target:
+        raise HTTPException(422, 'Choose two different services.')
+    direct.save_rule(payload.source, payload.target, payload.scheduled)
+    return direct.status()
+
+
+@app.post('/v1/direct-sync/run', status_code=202, dependencies=[Depends(admin)])
+async def direct_run(payload: DirectDirection):
+    validate_direction(payload)
+    return direct.submit(payload.source, payload.target)
+
+
+@app.post('/v1/direct-sync/{transfer_id}/undo', status_code=202, dependencies=[Depends(admin)])
+async def direct_undo(transfer_id: str):
+    try:
+        return direct.submit_undo(transfer_id)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
 
 @app.get('/v1/accounts', dependencies=[Depends(admin)])
 def accounts():
