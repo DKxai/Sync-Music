@@ -6,6 +6,7 @@ import os
 from datetime import datetime, timezone, timedelta
 import hashlib
 import json
+from email.utils import parsedate_to_datetime
 from math import ceil
 import secrets
 import time
@@ -75,10 +76,16 @@ def record_rate_limit(response):
     except (ValueError, AttributeError):
         pass
     fallback = 3600 if reason == 'quota' else 30
-    try:
-        delay = max(1, int(response.headers.get('Retry-After', fallback)))
-    except ValueError:
-        delay = fallback
+    retry_after = response.headers.get('Retry-After')
+    delay = fallback
+    if retry_after:
+        try:
+            delay = max(1, int(retry_after))
+        except ValueError:
+            try:
+                delay = max(1, parsedate_to_datetime(retry_after).timestamp() - time.time())
+            except (ValueError, TypeError, OverflowError):
+                pass
     deadline = ceil(time.time() + delay)
     if host == 'api.spotify.com':
         set_setting('spotify_limit_reason', reason)
@@ -282,6 +289,7 @@ async def fetch():
         likes = await paged(f'{API}/me/tracks', 'đọc bài đã thích', {'limit':50})
         follow=[]
         after=None
+        seen_cursors = set()
         while True:
             params={'type':'artist','limit':50}
             if after: params['after']=after
@@ -292,7 +300,11 @@ async def fetch():
                 raise ProviderResponseError('Spotify đọc nghệ sĩ đã theo dõi: phản hồi thiếu danh sách kết quả.')
             follow.extend(d['items'])
             after=(d.get('cursors') or {}).get('after')
-            if not d.get('next') or not after: break
+            if not d.get('next'):
+                break
+            if not isinstance(after, str) or not after or after in seen_cursors:
+                raise ProviderResponseError('Spotify trả về trang nghệ sĩ chưa đầy đủ hoặc trùng lặp.')
+            seen_cursors.add(after)
         playlists = await paged(f'{API}/me/playlists', 'đọc danh sách playlist', {'limit':50})
         me_resp = await request(client, 'GET', f'{API}/me')
         me_resp.raise_for_status()
@@ -316,6 +328,10 @@ async def fetch():
             out['owned_playlist'].append(Item('owned_playlist',p['id'],p.get('name') or '',kind='playlist',raw={'snapshot_id':p.get('snapshot_id'),'collaborative':p.get('collaborative'),'owned_by_me':bool(my_id and owner == my_id),'public':p.get('public')}))
             scope = f"playlist:{p['id']}"
             version = p.get('snapshot_id')
+            summary = p.get('items') or p.get('tracks')
+            if version and isinstance(summary, dict) and type(summary.get('total')) is int and summary['total'] == 0:
+                out[scope] = []
+                continue
             cached = playlist_cache(my_id, p['id'], version)
             if cached is not None:
                 out[scope] = cached

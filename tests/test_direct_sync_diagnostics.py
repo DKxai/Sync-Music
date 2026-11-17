@@ -553,6 +553,7 @@ def test_spotify_snapshot_version_reuses_playlist_without_reading_tracks(databas
             '/v1/me/tracks': {'items': []},
             '/v1/me/following': {'artists': {'items': []}},
             '/v1/me/playlists': {'items': [
+                {'id': 'empty', 'owner': {'id': 'account'}, 'snapshot_id': version, 'items': {'total': 0}},
                 {'id': 'playlist', 'owner': {'id': 'account'}, 'snapshot_id': version, 'name': 'Mix'},
             ]},
             '/v1/me': {'id': 'account'},
@@ -567,6 +568,7 @@ def test_spotify_snapshot_version_reuses_playlist_without_reading_tracks(databas
     async def scenario():
         nonlocal version
         first = await spotify.fetch()
+        assert first['playlist:empty'] == []
         assert first == await spotify.fetch()
         assert calls.count('/v1/playlists/playlist/items') == 1
         version = 'version-2'

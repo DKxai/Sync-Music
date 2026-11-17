@@ -45,6 +45,13 @@ dialog::backdrop{background:#080a0ed0}
 .progress-steps li{padding:2px 8px;border:1px solid var(--border);border-radius:8px;color:var(--muted)}
 .progress-steps [aria-current="step"]{border-color:var(--accent);color:var(--ink)}
 
+.workspace-nav{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:18px}
+.workspace-nav a{border:1px solid var(--border);border-radius:24px;padding:8px 15px;text-decoration:none;color:var(--ink)}
+.workspace-nav a:hover{border-color:var(--accent)}
+.provider[data-state="error"] .provider-status{color:#ffbfaf}
+.provider-status{border-left:3px solid currentColor;padding-left:10px}
+#serverSummary{display:grid;grid-template-columns:max-content 1fr;gap:8px 18px}
+#serverSummary dd{margin:0}#serverSummary dt{color:var(--muted)}
 [hidden]{display:none!important}
 @media(max-width:760px){.providers-grid{grid-template-columns:1fr}.provider-status{min-height:initial}}
 </style></head>
@@ -60,6 +67,8 @@ dialog::backdrop{background:#080a0ed0}
   <p id="loginMessage" class="muted" role="status"></p>
 </section>
 <div id="workspace" hidden>
+<nav class="workspace-nav" aria-label="Đi tới"><a href="#direct">Đồng bộ</a><a href="#providers">Kết nối dịch vụ</a><a href="#importPanel">Lịch sử nhập</a></nav>
+<p id="overviewError" role="status" hidden></p>
 <section id="direct">
   <h1>Đồng bộ thư viện</h1>
   <p class="muted">Chuyển bài đã thích vào Liked Music hoặc Liked Songs. Bài trong playlist riêng được thêm vào playlist tương ứng.</p>
@@ -146,7 +155,7 @@ dialog::backdrop{background:#080a0ed0}
   <summary>Lượt gọi API trong 7 ngày</summary>
   <ul id="providerRequests"></ul>
 </details>
-<details class="panel"><summary>Nhập dữ liệu về máy chủ</summary>
+<details id="importPanel" class="panel"><summary>Nhập dữ liệu về máy chủ</summary>
 <div class="flex"><button data-provider="all">Tất cả</button><button data-provider="spotify">Spotify</button><button data-provider="ytmusic">YouTube Music</button><button data-provider="apple">Apple Music</button></div>
 <p id="message" role="status"></p><div id="imports"></div></details>
 <details id="review" class="panel">
@@ -174,13 +183,16 @@ dialog::backdrop{background:#080a0ed0}
 <button id="transferExecute" disabled>Tạo playlist và nhập bài đã ghép</button>
 <p id="transferStatus" role="status"></p>
 </details>
-<details class="panel"><summary>Chi tiết máy chủ</summary><pre id="status"></pre></details>
+<details class="panel"><summary>Chi tiết máy chủ</summary><dl id="serverSummary"><dt>Chế độ</dt><dd id="syncMode"></dd><dt>Thư viện gốc</dt><dd id="baselineState"></dd></dl></details>
 </div>
 </main>
 <script>
 let connected=false, refreshing=false, ruleDirty=false, ruleApplied='', undoRendered='', directBusy=false;
 let googleGrant, googleTimer;
 const $=x=>document.getElementById(x);
+document.querySelector('a[href="#importPanel"]').addEventListener('click',()=>{
+  $('importPanel').open=true;
+});
 async function request(path,method='GET',body,headers={}) {
   const options={method,headers,cache:'no-store'};
   if (body!==undefined) {
@@ -217,10 +229,10 @@ async function update(){
   $('spotifyUri').textContent=config.spotify_redirect_uri;
   for (const provider of ['spotify','ytmusic','apple']) {
     const account=accounts.find(a=>a.provider===provider);
-    let status='Thiếu cấu hình trên máy chủ';
+    let status=provider==='apple'?'Chưa kết nối · Tùy chọn':'Thiếu cấu hình trên máy chủ';
     if (config.provider_ready[provider]) {
       status='Đã cấu hình, chờ nhập lần đầu';
-      if (account?.last_error) status='Lần nhập gần nhất báo lỗi. Xem trạng thái bên dưới.';
+      if (account?.last_error) status='Lần nhập gần nhất gặp lỗi · '+account.last_error;
       else if (account?.last_success_at) status='Đã nhập thành công lúc '+account.last_success_at+' UTC';
     } else if (config[provider+'_oauth_configured']) {
       status='Chờ cấp quyền';
@@ -234,16 +246,21 @@ async function update(){
     if(provider==='ytmusic' && config.ytmusic_retry_at && config.provider_ready.ytmusic)
       status='Đã kết nối · Chờ YouTube Music tới '+retryTime(config.ytmusic_retry_at);
     $(provider+'Status').textContent=status;
+    $(provider+'Card').dataset.state=config.provider_ready[provider] && account?.last_error?'error':'ready';
     $(provider+'Card').dataset.connected=String(provider==='spotify' ? config.provider_ready.spotify : account?.status==='connected');
   }
-  $('status').textContent=JSON.stringify({mode:config.write_enabled?'REVIEWED ADDITIONS':direct.enabled?'DIRECT TRANSFER':'READ-ONLY',baseline_approved:config.baseline_approved,poll_minutes:config.poll_minutes,accounts,jobs,direct_sync:direct.job},null,2);
+  $('syncMode').textContent=config.write_enabled?'Duyệt trước khi thêm':direct.enabled?'Chuyển trực tiếp':'Chỉ đọc';
+  $('baselineState').textContent=config.baseline_approved?'Đã duyệt':'Chưa duyệt';
+  $('overviewError').hidden=true;
   const busy=Object.values(jobs).some(x=>x.state==='queued'||x.state==='running');
   refreshDelay=busy || ['queued','running'].includes(direct.job?.state) ? 3500 : 20000;
   document.querySelectorAll('button[data-provider]').forEach(b=>{
-    b.disabled=busy || (b.dataset.provider==='all' ? !Object.values(config.provider_ready).some(Boolean)
-      : !config.provider_ready[b.dataset.provider]);
+    const available=Object.keys(config.provider_ready).some(provider=>
+      (b.dataset.provider==='all' || b.dataset.provider===provider) && config.provider_ready[provider]
+      && !['running','queued'].includes(jobs[provider]?.state));
+    b.disabled=!available;
   });
-  } catch(e) { $('status').textContent=e.message; }
+  } catch(e) { $('overviewError').textContent=e.message; $('overviewError').hidden=false; }
     finally { refreshing=false; }
 }
 function showSession(ready,message=''){
