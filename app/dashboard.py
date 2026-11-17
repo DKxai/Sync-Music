@@ -166,7 +166,7 @@ async function update(){
     $(provider+'Status').textContent=status;
     $(provider+'Card').dataset.connected=String(account?.status==='connected');
   }
-  $('status').textContent=JSON.stringify({mode:config.write_enabled?'REVIEWED ADDITIONS':'READ-ONLY',baseline_approved:config.baseline_approved,poll_minutes:config.poll_minutes,accounts,jobs},null,2);
+  $('status').textContent=JSON.stringify({mode:config.write_enabled?'REVIEWED ADDITIONS':direct.enabled?'DIRECT TRANSFER':'READ-ONLY',baseline_approved:config.baseline_approved,poll_minutes:config.poll_minutes,accounts,jobs},null,2);
   let busy=Object.values(jobs).some(x=>x.state==='queued'||x.state==='running');
   document.querySelectorAll('button[data-provider]').forEach(b=>{
     b.disabled=busy || (b.dataset.provider!=='all' && !config.provider_ready[b.dataset.provider]);
