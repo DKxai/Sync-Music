@@ -7,7 +7,8 @@ import time
 from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from math import ceil
+from pathlib import Path
+from traceback import extract_tb
 from uuid import uuid4
 
 import httpx
@@ -15,7 +16,7 @@ from requests.exceptions import ConnectionError as RequestsConnectionError, Time
 from ytmusicapi.exceptions import YTMusicServerError
 
 from ..connectors import spotify, ytmusic
-from ..connectors.base import Item
+from ..connectors.base import Item, NotConfigured, ProviderResponseError
 from ..db import connect
 from . import direct_results, undo
 from .destinations import PlaylistConflict, SpotifyDestination, WriteVerificationError, YouTubeDestination, batches
@@ -95,8 +96,7 @@ async def _wait_until(job_id, retry_at):
         con.execute('UPDATE direct_sync_job SET retry_at=NULL WHERE job_id=?', (job_id,))
 
 
-async def _wait_for_spotify(job_id, delay):
-    retry_at = ceil(time.time() + delay)
+async def _wait_for_spotify(job_id, retry_at):
     with connect() as con:
         con.execute('UPDATE direct_sync_job SET retry_at=? WHERE job_id=?', (retry_at, job_id))
     await _wait_until(job_id, retry_at)
@@ -450,7 +450,8 @@ def _playlist_failure(job_id, source, target, tracks, result, exc):
 
 
 def _is_item_error(exc):
-    if isinstance(exc, (httpx.TransportError, RequestsConnectionError, RequestsTimeout, WriteVerificationError)):
+    if isinstance(exc, (httpx.TransportError, RequestsConnectionError, RequestsTimeout,
+                        WriteVerificationError, ProviderResponseError)):
         return True
     status = _provider_status(exc)
     return status in (400, 404) or (status is not None and status >= 500)
@@ -484,7 +485,7 @@ async def destination_client(target):
         async with httpx.AsyncClient(timeout=25, headers={'Authorization': f'Bearer {token}'}) as http:
             yield SpotifyDestination(http)
     else:
-        yield YouTubeDestination(await asyncio.to_thread(ytmusic.client))
+        yield YouTubeDestination(await ytmusic.call('khởi tạo kết nối', ytmusic.client))
 
 
 def submit_undo(transfer_id):
@@ -540,7 +541,7 @@ async def run_undo(job_id, transfer_id, target):
 
 
 def _error(exc):
-    if isinstance(exc, spotify.MissingWriteScope):
+    if isinstance(exc, (spotify.MissingWriteScope, NotConfigured, ProviderResponseError)):
         return str(exc)
     if isinstance(exc, httpx.HTTPStatusError):
         request = exc.request
@@ -565,6 +566,12 @@ def _error(exc):
         return 'Yêu cầu tới dịch vụ âm nhạc vượt thời gian chờ.'
     if isinstance(exc, (httpx.TransportError, RequestsConnectionError)):
         return 'Kết nối tới dịch vụ âm nhạc bị gián đoạn.'
+    if isinstance(exc, KeyError):
+        frames = extract_tb(exc.__traceback__, limit=-1)
+        if frames:
+            frame = frames[0]
+            return f'Thiếu trường dữ liệu khi đồng bộ ({Path(frame.filename).name}:{frame.lineno}).'
+        return 'Thiếu trường dữ liệu khi đồng bộ.'
     return f'Direct sync stopped ({type(exc).__name__}).'
 
 
@@ -572,11 +579,12 @@ async def run(job_id, source, target, *, resumed=False, retry_at=None):
     result = dict(unmatched=0, tracks_failed=0,
                   liked_added=0, playlist_tracks_added=0, playlists_need_review=0)
     pairs = directions(source, target)
-    token = spotify.rate_limit_waiter.set(lambda delay: _wait_for_spotify(job_id, delay))
+    token = spotify.rate_limit_waiter.set(lambda deadline: _wait_for_spotify(job_id, deadline))
     try:
         async with POLL_LOCK:
-            if retry_at:
-                await _wait_until(job_id, retry_at)
+            deadline = max(retry_at or 0, spotify.api_retry_at() or 0)
+            if deadline:
+                await _wait_for_spotify(job_id, deadline)
             if resumed:
                 with connect() as con:
                     con.execute('DELETE FROM direct_sync_items WHERE job_id=?', (job_id,))

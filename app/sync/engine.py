@@ -6,7 +6,7 @@ from httpx import HTTPStatusError
 
 from ..config import settings
 from ..connectors import spotify, ytmusic, apple
-from ..connectors.base import NotConfigured
+from ..connectors.base import NotConfigured, ProviderResponseError
 from ..db import connect
 from .safety import deletion_is_safe
 from .review import plan_add
@@ -106,14 +106,21 @@ def persist(provider: str, scopes: dict):
 
 async def poll(provider: str):
     if provider not in FETCHERS:raise ValueError('Unknown provider')
+    if provider == 'spotify' and (deadline := spotify.api_retry_at()):
+        return {'provider': provider, 'retry_at': deadline}
     # Only one provider poll / SQLite merge at a time. One worker by design.
     async with POLL_LOCK:
+        if provider == 'spotify' and (deadline := spotify.api_retry_at()):
+            return {'provider': provider, 'retry_at': deadline}
         try:
             scopes=await FETCHERS[provider]()
             return persist(provider,scopes)
         except Exception as exc:
             # No partial snapshot is committed on error.
-            if isinstance(exc, (NotConfigured, ytmusic.ImportRequestError, SnapshotValidationError)):
+            if provider == 'spotify' and isinstance(exc, HTTPStatusError):
+                if deadline := spotify.record_rate_limit(exc.response):
+                    return {'provider': provider, 'retry_at': deadline}
+            if isinstance(exc, (NotConfigured, ProviderResponseError, SnapshotValidationError)):
                 message = str(exc)
             elif isinstance(exc, HTTPStatusError):
                 message = f'Provider returned HTTP {exc.response.status_code}'

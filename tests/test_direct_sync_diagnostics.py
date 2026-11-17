@@ -11,8 +11,8 @@ import pytest
 from app import db, main
 from app.connectors import spotify
 from app.connectors.base import Item
-from app.sync import direct, direct_results, undo
-from app.sync.destinations import SpotifyDestination
+from app.sync import direct, direct_results, engine, undo
+from app.sync.destinations import SpotifyDestination, YouTubeDestination
 from app.sync.matcher import catalog_match
 from app.sync.transfer import ExportTrack
 
@@ -56,6 +56,80 @@ def test_token_scope_preflight_reads_the_granted_scope(monkeypatch):
     assert asyncio.run(spotify.access_token()) == 'test'
     saved['scope'] += ' playlist-modify-private user-library-modify'
     assert asyncio.run(spotify.access_token(required_scopes=spotify.DIRECT_WRITE_SCOPES)) == 'test'
+
+
+def test_spotify_oauth_import_waits_and_retries_without_marking_account_disconnected(database, monkeypatch):
+    response = httpx.Response(429, headers={'Retry-After': '1'},
+                             request=httpx.Request('GET', f'{spotify.API}/me/tracks'))
+
+    async def scenario():
+        requested = asyncio.Event()
+
+        async def fetch():
+            if not requested.is_set():
+                requested.set()
+                response.raise_for_status()
+            return {'liked': [], 'owned_playlist': []}
+
+        fetch_spotify = AsyncMock(side_effect=fetch)
+        monkeypatch.setitem(engine.FETCHERS, 'spotify', fetch_spotify)
+        monkeypatch.setattr(spotify, 'redeem', AsyncMock())
+        monkeypatch.setattr(main, '_jobs', {})
+        monkeypatch.setattr(main, '_active', {})
+        monkeypatch.setattr(main, '_tasks', set())
+        with db.connect() as con:
+            con.execute("UPDATE accounts SET status='connected' WHERE provider='spotify'")
+
+        callback = await main.spotify_callback(code='accepted', state='pending')
+        assert 'Đã cấp quyền Spotify' in callback.body.decode()
+        await asyncio.wait_for(requested.wait(), timeout=3)
+
+        job = main.sync_status()['spotify']
+        assert job['trigger'] == 'oauth' and job['state'] == 'running'
+        assert job['retry_at'] == spotify.api_retry_at()
+        assert not engine.POLL_LOCK.locked()
+        assert (await engine.poll('spotify'))['retry_at'] == job['retry_at']
+        fetch_spotify.assert_awaited_once()
+        account = next(row for row in main.accounts() if row['provider'] == 'spotify')
+        assert account['status'] == 'connected' and account['last_error'] is None
+
+        await asyncio.wait_for(asyncio.gather(*main._tasks), timeout=4)
+        assert main.sync_status()['spotify']['state'] == 'completed'
+        assert fetch_spotify.await_count == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('target', ['spotify', 'ytmusic'])
+def test_incomplete_search_response_does_not_stop_other_tracks(database, monkeypatch, target):
+    class YouTubeAPI:
+        def search(self, query, *, filter, limit):
+            if query.startswith('First'):
+                raise KeyError('tracking data')
+            return [{'videoId': 'y2', 'title': 'Second', 'artists': [{'name': 'Artist'}], 'duration_seconds': 200}]
+
+    def send(request):
+        if request.url.params['q'].startswith('First'):
+            return httpx.Response(200, json={})
+        return httpx.Response(200, json={'tracks': {'items': [
+            {'id': 's2', 'name': 'Second', 'artists': [{'name': 'Artist'}], 'duration_ms': 200000},
+        ]}})
+
+    async def scenario():
+        source = 'spotify' if target == 'ytmusic' else 'ytmusic'
+        snapshot = {'liked': [Item('liked', key, title, artist='Artist', duration_ms=200000)
+                              for key, title in [('first', 'First'), ('second', 'Second')]], 'owned_playlist': []}
+        result = dict(unmatched=0, tracks_failed=0)
+        async with httpx.AsyncClient(transport=httpx.MockTransport(send)) as http:
+            adapter = SpotifyDestination(http) if target == 'spotify' else YouTubeDestination(YouTubeAPI())
+            await direct._plan('job', source, target, snapshot, adapter, result)
+
+        assert result == dict(unmatched=0, tracks_failed=1)
+        failed = direct_results.list_items('failed', 0, 25)['items'][0]
+        assert failed['title'] == 'First' and 'tra cứu bài hát' in failed['reason']
+        assert direct_results.list_items('pending', 0, 25)['items'][0]['title'] == 'Second'
+
+    asyncio.run(scenario())
 
 
 def test_spotify_write_403_records_track_failure_without_phantom_undo(database, monkeypatch):
