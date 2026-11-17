@@ -1,6 +1,5 @@
 """Destination operations for additive Spotify and YouTube Music transfers."""
 import asyncio
-from collections import Counter
 
 import httpx
 
@@ -47,14 +46,15 @@ class SpotifyDestination:
     async def apply_likes(self, ids, journal):
         for batch in batches(ids, 40):
             saved = await self._saved(batch)
-            if len(saved) != len(batch):
+            if not isinstance(saved, list) or len(saved) != len(batch) or any(type(value) is not bool for value in saved):
                 raise ValueError('Spotify did not confirm the existing likes.')
             batch = [value for value, present in zip(batch, saved) if not present]
             if not batch:
                 continue
             entry = journal.record('likes', batch)
             uris = ','.join(f'spotify:track:{value}' for value in batch)
-            await self.request('PUT', '/me/library', params={'uris': uris})
+            with journal.attempt(entry):
+                await self.request('PUT', '/me/library', params={'uris': uris})
             if await self._saved(batch) != [True] * len(batch):
                 raise ValueError('Spotify could not verify saved tracks.')
             journal.confirm(entry)
@@ -210,13 +210,3 @@ class YouTubeDestination:
             [item.get('videoId') for item in added] == ids and all(item.get('setVideoId') for item in added)
         ) else None
 
-
-def missing_occurrences(wanted, existing):
-    counts = Counter(existing)
-    missing = []
-    for track_id in wanted:
-        if counts[track_id]:
-            counts[track_id] -= 1
-        else:
-            missing.append(track_id)
-    return missing

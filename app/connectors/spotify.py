@@ -16,6 +16,18 @@ from ..provider_tokens import invalidate_account
 API = 'https://api.spotify.com/v1'
 AUTH = 'https://accounts.spotify.com'
 SCOPES = 'user-library-read user-follow-read playlist-read-private playlist-read-collaborative'
+DIRECT_WRITE_SCOPES = frozenset({'user-library-modify', 'playlist-modify-private'})
+
+
+class MissingWriteScope(ValueError):
+    pass
+
+
+def _require_scopes(tokens, required):
+    missing = required.difference((tokens.get('scope') or '').split())
+    if missing:
+        raise MissingWriteScope('Spotify thiếu quyền ' + ', '.join(sorted(missing))
+                                + '. Bấm Kết nối Spotify và cấp lại quyền.')
 
 
 def _cipher():
@@ -36,8 +48,11 @@ def _save_tokens(tokens: dict, *, reconnect: bool = False):
         existing = _load_tokens()
     except NotConfigured:
         pass
-    if existing and not reconnect and not tokens.get('refresh_token'):
-        tokens['refresh_token'] = existing.get('refresh_token')
+    if existing and not reconnect:
+        if not tokens.get('refresh_token'):
+            tokens['refresh_token'] = existing.get('refresh_token')
+        if 'scope' not in tokens:
+            tokens['scope'] = existing.get('scope')
     token = _cipher().encrypt(json.dumps(tokens).encode())
     with connect() as con:
         con.execute('INSERT INTO encrypted_tokens(provider,payload_ciphertext) VALUES(?,?) ON CONFLICT(provider) DO UPDATE SET payload_ciphertext=excluded.payload_ciphertext,updated_at=datetime("now")', ('spotify',token))
@@ -64,6 +79,8 @@ def auth_url():
     if direct_transfer or os.getenv('PLAYLIST_TRANSFER_ENABLED', '').lower() == 'true':
         scope += ' playlist-modify-private'
     params = dict(response_type='code',client_id=settings.spotify_client_id,redirect_uri=settings.spotify_redirect_uri,code_challenge_method='S256',code_challenge=challenge,scope=scope,state=state)
+    if direct_transfer:
+        params['show_dialog'] = 'true'
     return f'{AUTH}/authorize?{urlencode(params)}'
 
 
@@ -88,11 +105,12 @@ async def redeem(code: str, state: str):
     _save_tokens(data, reconnect=True)
 
 
-async def access_token():
+async def access_token(*, required_scopes=frozenset()):
     tokens = _load_tokens()
     if tokens.get('client_id', settings.spotify_client_id) != settings.spotify_client_id:
         raise NotConfigured('Spotify Client ID changed. Reconnect Spotify.')
     if tokens.get('expires_at',0) > datetime.now(timezone.utc).timestamp():
+        _require_scopes(tokens, required_scopes)
         return tokens['access_token']
     if not tokens.get('refresh_token'):
         raise NotConfigured('Spotify refresh_token missing: reconnect Spotify')
@@ -103,6 +121,7 @@ async def access_token():
     data['expires_at'] = (datetime.now(timezone.utc) + timedelta(seconds=int(data['expires_in'])-60)).timestamp()
     data['client_id'] = settings.spotify_client_id
     _save_tokens(data)
+    _require_scopes(data, required_scopes)
     return data['access_token']
 
 

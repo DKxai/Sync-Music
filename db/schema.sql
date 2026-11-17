@@ -207,3 +207,18 @@ CREATE TABLE IF NOT EXISTS direct_sync_undo (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS direct_sync_undo_job_idx ON direct_sync_undo(job_id,id);
+
+CREATE TABLE IF NOT EXISTS direct_sync_items (
+  job_id TEXT NOT NULL,
+  source TEXT NOT NULL,
+  target TEXT NOT NULL,
+  position INTEGER NOT NULL,
+  title TEXT NOT NULL,
+  artist TEXT,
+  collection TEXT,
+  status TEXT NOT NULL,
+  reason TEXT,
+  PRIMARY KEY(job_id, source, position)
+);
+CREATE INDEX IF NOT EXISTS direct_sync_items_status_idx
+  ON direct_sync_items(job_id, status, source, position);
