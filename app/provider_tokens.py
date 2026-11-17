@@ -44,6 +44,14 @@ def invalidate_account(con, provider: str) -> None:
         """UPDATE accounts SET status='connected', last_success_at=NULL, last_error=NULL,
            updated_at=datetime('now') WHERE provider=?""", (provider,)
     )
+    con.execute(
+        """INSERT INTO settings(key,value) VALUES (?, '1') ON CONFLICT(key)
+           DO UPDATE SET value=CAST(settings.value AS INTEGER)+1""", (provider + '_auth_version',),
+    )
+    con.execute('DELETE FROM direct_catalog_cache WHERE target=?', (provider,))
+    con.execute("DELETE FROM settings WHERE key LIKE 'direct_observation:%'")
+    con.execute('DELETE FROM library_versions WHERE provider=?', (provider,))
+    con.execute('DELETE FROM sync_schedule WHERE name IN (?,?)', (provider, 'direct'))
     con.execute("UPDATE settings SET value='false',updated_at=datetime('now') WHERE key='baseline_approved'")
     con.execute('UPDATE source_states SET present=0,missing_streak=0 WHERE provider=? AND present=1', (provider,))
     con.execute(

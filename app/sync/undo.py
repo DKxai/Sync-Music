@@ -77,6 +77,15 @@ class Journal:
             ).fetchall()
         return [(row['id'], json.loads(row['ids_json']), json.loads(row['guard_json'])) for row in rows]
 
+    def pending_playlist(self, playlist_id):
+        with connect() as con:
+            rows = con.execute(
+                """SELECT id,ids_json,guard_json FROM direct_sync_undo WHERE target=? AND account=?
+                   AND kind='playlist' AND playlist_id=? AND status='pending'""",
+                (self.target, self.account, playlist_id),
+            )
+            return [(row['id'], json.loads(row['ids_json']), json.loads(row['guard_json'])) for row in rows]
+
     def checkpoint(self, entry, guard):
         with connect() as con:
             con.execute('UPDATE direct_sync_undo SET guard_json=? WHERE id=?', (json.dumps(guard), entry))
@@ -136,9 +145,12 @@ async def reverse(run_id, adapter, result, report):
             try:
                 restored = await adapter.undo_playlist(row['playlist_id'], ids, guard)
             except httpx.HTTPStatusError as exc:
-                if exc.response.status_code != 404:
+                if await spotify.wait_after_rate_limit(exc.response):
+                    restored = await adapter.undo_playlist(row['playlist_id'], ids, guard)
+                elif exc.response.status_code == 404:
+                    restored = False
+                else:
                     raise
-                restored = False
             if restored:
                 _completed(row['id'], row, guard, restored if isinstance(restored, str) else None)
                 result['playlist_tracks_removed'] += len(ids)

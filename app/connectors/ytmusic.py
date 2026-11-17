@@ -2,9 +2,65 @@ import asyncio
 import json
 import re
 import time
+from contextvars import ContextVar
+from math import ceil
+
+from requests import Session
+
+from . import requests_log
 from .base import Item, NotConfigured, ProviderResponseError
 from ..config import settings
 from ..provider_tokens import load_token, save_token
+from ..db import get_setting, set_setting
+
+
+rate_limit_waiter = ContextVar('ytmusic_rate_limit_waiter', default=None)
+
+
+class RateLimited(Exception):
+    def __init__(self, retry_at):
+        self.retry_at = retry_at
+        super().__init__('YouTube Music đang giới hạn yêu cầu.')
+
+
+def api_retry_at():
+    deadline = int(get_setting('ytmusic_api_retry_at') or 0)
+    return deadline if deadline > time.time() else None
+
+
+class MusicSession(Session):
+    def request(self, method, url, **kwargs):
+        if deadline := api_retry_at():
+            raise RateLimited(deadline)
+        kwargs.setdefault('timeout', 30)
+        endpoint = url.partition('?')[0]
+        operation = ('search' if endpoint.endswith('/search') else 'write'
+                     if any(part in endpoint for part in ('/like/', '/edit_playlist', '/playlist/', '/subscription/'))
+                     else 'read')
+        response = super().request(method, url, **kwargs)
+        requests_log.record('ytmusic', operation, response.status_code)
+        if response.status_code == 429:
+            try:
+                delay = max(1, int(response.headers.get('Retry-After', '60')))
+            except ValueError:
+                delay = 60
+            deadline = ceil(time.time() + delay)
+            set_setting('ytmusic_api_retry_at', str(deadline))
+            raise RateLimited(deadline)
+        return response
+
+
+def duration_ms(track):
+    seconds = track.get('duration_seconds')
+    if type(seconds) in (int, float) and 0 < seconds < 86400:
+        return round(seconds * 1000)
+    value = track.get('duration')
+    if isinstance(value, str) and re.fullmatch(r'\d{1,3}(?::[0-5]\d){1,2}', value):
+        total = 0
+        for part in value.split(':'):
+            total = total * 60 + int(part)
+        return total * 1000 or None
+    return None
 
 def client():
     from ytmusicapi import OAuthCredentials, YTMusic
@@ -21,10 +77,10 @@ def client():
                 token.update(refreshed)
                 token['expires_at'] = int(time.time()) + int(token['expires_in'])
                 save_token('ytmusic', token)
-            return YTMusic(token, oauth_credentials=credentials)
+            return YTMusic(token, oauth_credentials=credentials, requests_session=MusicSession())
     if not settings.ytm_auth_path.is_file():
         raise NotConfigured('Connect YouTube Music via OAuth or set private/ytmusic_browser.json')
-    return YTMusic(str(settings.ytm_auth_path))
+    return YTMusic(str(settings.ytm_auth_path), requests_session=MusicSession())
 
 
 class ImportRequestError(ProviderResponseError):
@@ -49,25 +105,34 @@ def _read(stage, method, *args, **kwargs):
 
 
 async def call(stage, method, *args, **kwargs):
-    try:
-        return await asyncio.to_thread(method, *args, **kwargs)
-    except KeyError:
-        raise ProviderResponseError(f'YouTube Music không trả đủ dữ liệu khi {stage}.') from None
+    while True:
+        try:
+            return await asyncio.to_thread(method, *args, **kwargs)
+        except RateLimited as exc:
+            waiter = rate_limit_waiter.get()
+            if waiter is None:
+                raise
+            await waiter(exc.retry_at)
+        except KeyError:
+            raise ProviderResponseError(f'YouTube Music không trả đủ dữ liệu khi {stage}.') from None
 
 
 def _fetch_sync():
     api = _read('initialize client', client)
-    likes = _read('read liked songs', api.get_liked_songs, limit=100000)
+    likes = _read('read liked songs', api.get_liked_songs, limit=None)
     if not isinstance(likes, dict) or not isinstance(likes.get('tracks'), list):
         raise ImportRequestError('YouTube Music read liked songs: missing or invalid tracks list')
     out={'liked':[], 'followed_artist':[], 'owned_playlist':[]}
     liked_ids = set()
-    for t in likes['tracks']:
+    for pos, t in enumerate(likes['tracks']):
         video_id = t.get('videoId')
-        if not video_id or video_id in liked_ids:
+        if not video_id:
+            out['liked'].append(unavailable('liked', pos, t))
+            continue
+        if video_id in liked_ids:
             continue
         liked_ids.add(video_id)
-        out['liked'].append(Item('liked',video_id,t.get('title') or '',artist=', '.join(a.get('name','') for a in t.get('artists') or []),album=(t.get('album') or {}).get('name'),duration_ms=(t.get('duration_seconds') or 0)*1000 or None))
+        out['liked'].append(Item('liked',video_id,t.get('title') or '',artist=', '.join(a.get('name','') for a in t.get('artists') or []),album=(t.get('album') or {}).get('name'),duration_ms=duration_ms(t)))
     for a in _read('read artist subscriptions', api.get_library_subscriptions, limit=100000):
         if a.get('browseId'):out['followed_artist'].append(Item('followed_artist',a['browseId'],a.get('artist') or '',kind='artist'))
     for p in _read('list library playlists', api.get_library_playlists, limit=None):
@@ -80,14 +145,21 @@ def _fetch_sync():
         scope=f'playlist:{pid}'
         out[scope]=[]
         for pos,t in enumerate(full['tracks']):
-            if not t.get('videoId'):continue
+            if not t.get('videoId'):
+                out[scope].append(unavailable(scope, pos, t))
+                continue
             # setVideoId is required for precise removal of duplicate occurrences.
             occurrence = t.get('setVideoId') or f"{pos}:{t['videoId']}"
-            out[scope].append(Item(scope,occurrence,t.get('title') or '',artist=', '.join(a.get('name','') for a in t.get('artists') or []),album=(t.get('album') or {}).get('name'),duration_ms=(t.get('duration_seconds') or 0)*1000 or None,raw={'track_id':t['videoId'],'position':pos,'setVideoId':t.get('setVideoId')}))
+            out[scope].append(Item(scope,occurrence,t.get('title') or '',artist=', '.join(a.get('name','') for a in t.get('artists') or []),album=(t.get('album') or {}).get('name'),duration_ms=duration_ms(t),raw={'track_id':t['videoId'],'position':pos,'setVideoId':t.get('setVideoId')}))
     return out
 
+def unavailable(scope, position, track):
+    return Item(scope, f'unavailable:{position}', track.get('title') or 'Bài không khả dụng',
+                raw={'position': position, 'unavailable': True})
+
+
 async def fetch():
-    return await asyncio.to_thread(_fetch_sync)
+    return await call('đọc thư viện', _fetch_sync)
 
 
 def _contains_sync(scope: str, remote_id: str) -> bool:

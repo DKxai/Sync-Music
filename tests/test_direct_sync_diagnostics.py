@@ -493,3 +493,140 @@ def test_result_groups_preserve_existing_database_rows(tmp_path, monkeypatch):
     assert group['key'] == 'name:Old playlist'
     items = direct_results.list_items(None, 0, 25, source='spotify', collection_key=group['key'])
     assert items['items'][0]['title'] == 'Existing song'
+
+
+def test_adaptive_schedule_coalesces_direct_and_provider_imports(database, monkeypatch):
+    from app.sync import schedule
+
+    monkeypatch.setattr(main, 'provider_ready', lambda _: True)
+    imports, transfers = [], []
+    monkeypatch.setattr(main, 'submit', lambda provider, trigger: imports.append(provider))
+    monkeypatch.setattr(direct, 'submit', lambda source, target, **_: transfers.append((source, target)))
+    direct.save_rule('both', 'both', True)
+
+    asyncio.run(main.scheduled_checks())
+    assert imports == ['apple']
+    assert transfers == [('both', 'both')]
+    schedule.record('direct', 10, unchanged=True)
+    schedule.record('apple', 10)
+    asyncio.run(main.scheduled_checks())
+    assert imports == ['apple'] and len(transfers) == 1
+    assert schedule.next_check('direct') > schedule.next_check('apple')
+
+
+def test_unchanged_scheduled_run_never_searches_or_writes(database, monkeypatch):
+    snapshot = {'liked': [], 'owned_playlist': []}
+    for provider in direct.SERVICES:
+        monkeypatch.setitem(direct.FETCHERS, provider, AsyncMock(return_value=snapshot))
+    monkeypatch.setattr(spotify, 'access_token', AsyncMock(return_value='test'))
+    adapter = AsyncMock()
+    adapter.account.return_value = 'owner'
+
+    @asynccontextmanager
+    async def destination(_):
+        yield adapter
+
+    monkeypatch.setattr(direct, 'destination_client', destination)
+
+    async def scenario():
+        direct.submit('ytmusic', 'spotify')
+        await direct._task
+        adapter.reset_mock()
+        direct.submit('ytmusic', 'spotify', scheduled=True)
+        await direct._task
+        assert direct.status()['job']['stage'] == 'no_changes'
+        assert not adapter.mock_calls
+        assert len(direct_results.history()) == 1
+
+    asyncio.run(scenario())
+
+
+def test_spotify_snapshot_version_reuses_playlist_without_reading_tracks(database, monkeypatch):
+    calls = []
+    version = 'version-1'
+    real_client = httpx.AsyncClient
+
+    def send(request):
+        path = request.url.path
+        calls.append(path)
+        values = {
+            '/v1/me/tracks': {'items': []},
+            '/v1/me/following': {'artists': {'items': []}},
+            '/v1/me/playlists': {'items': [
+                {'id': 'playlist', 'owner': {'id': 'account'}, 'snapshot_id': version, 'name': 'Mix'},
+            ]},
+            '/v1/me': {'id': 'account'},
+            '/v1/playlists/playlist/items': {'items': [{'item': {'id': 'track', 'name': 'Bài hát'}}]},
+            '/v1/playlists/playlist': {'snapshot_id': version},
+        }
+        return httpx.Response(200, json=values[path])
+
+    monkeypatch.setattr(spotify, 'access_token', AsyncMock(return_value='test'))
+    monkeypatch.setattr(spotify.httpx, 'AsyncClient', lambda **kw: real_client(transport=httpx.MockTransport(send), **kw))
+
+    async def scenario():
+        nonlocal version
+        first = await spotify.fetch()
+        assert first == await spotify.fetch()
+        assert calls.count('/v1/playlists/playlist/items') == 1
+        version = 'version-2'
+        await spotify.fetch()
+        assert calls.count('/v1/playlists/playlist/items') == 2
+
+    asyncio.run(scenario())
+
+
+def test_quota_wait_releases_other_imports(database, monkeypatch):
+    req = httpx.Request('GET', 'https://api.spotify.com/v1/search')
+    response = httpx.Response(429, request=req, json={'error': {'reason': 'QUOTA_EXCEEDED'}})
+    deadline = spotify.record_rate_limit(response)
+    assert db.get_setting('spotify_limit_reason') == 'quota'
+    assert deadline > int(datetime.now(timezone.utc).timestamp()) + 1800
+
+    async def simulate_wait(job, _):
+        assert not direct.POLL_LOCK.locked()
+        imported = await engine.poll('apple')
+        assert imported['provider'] == 'apple'
+
+    monkeypatch.setattr(direct, '_wait_until', simulate_wait)
+    monkeypatch.setitem(engine.FETCHERS, 'apple', AsyncMock(return_value={'library': []}))
+
+    async def scenario():
+        async with direct.POLL_LOCK:
+            await direct._wait_for_provider('job', deadline, {}, 'spotify')
+            assert direct.POLL_LOCK.locked()
+
+    asyncio.run(scenario())
+
+
+def test_ordered_insert_with_duplicates_preserves_playlist_occurrences():
+    source = [('a', 0), ('b', 1), ('a', 2), ('c', 3)]
+    assert direct._ordered_batches(source, ['b', 'a']) == [(0, [('a', 0)]), (3, [('c', 3)])]
+    assert direct._ordered_batches(source, ['unrelated']) is None
+
+
+def test_apple_library_songs_are_never_used_as_favorites(database, monkeypatch):
+    from app.connectors import apple
+
+    real_client = httpx.AsyncClient
+    calls = []
+    song = {'id': 'i.owned', 'type': 'library-songs', 'attributes': {'name': 'Apple library track'}}
+
+    def send(request):
+        calls.append(request.url.path)
+        values = {
+            '/v1/me/library/songs': [song],
+            '/v1/me/library/playlists': [{'id': 'p.curated', 'attributes': {'name': 'Curated', 'canEdit': False}}],
+            '/v1/me/library/playlists/p.favorites/tracks': [song],
+        }
+        return httpx.Response(200, json={'data': values[request.url.path]})
+
+    monkeypatch.setattr(apple, 'user_token', lambda: 'test')
+    monkeypatch.setattr(apple, 'headers_for', lambda _: {})
+    monkeypatch.setattr(apple.httpx, 'AsyncClient', lambda **kw: real_client(transport=httpx.MockTransport(send), **kw))
+    source = asyncio.run(apple.fetch())
+    assert source['liked'] == [] and len(source['library']) == 1 and source['owned_playlist'] == []
+    monkeypatch.setattr(apple, 'settings', replace(apple.settings, apple_favorites_playlist_id='p.favorites'))
+    source = asyncio.run(apple.fetch())
+    assert [track.remote_id for track in source['liked']] == ['i.owned']
+    assert '/v1/me/library/playlists/p.curated/tracks' not in calls

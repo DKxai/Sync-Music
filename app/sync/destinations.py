@@ -1,5 +1,4 @@
 """Destination operations for additive Spotify and YouTube Music transfers."""
-import asyncio
 from itertools import count
 
 import httpx
@@ -183,25 +182,41 @@ class SpotifyDestination:
             if len(data['items']) != 50:
                 raise PlaylistConflict('Spotify trả về một trang playlist không đầy đủ.')
 
+    async def insert(self, playlist_id, ids, position=None):
+        body = {'uris': [f'spotify:track:{value}' for value in ids]}
+        if position is not None:
+            body['position'] = position
+        response = await self.request('POST', f'/playlists/{playlist_id}/items', json=body)
+        return spotify.response_object(response, 'thêm bài vào playlist').get('snapshot_id')
+
     async def append(self, playlist_id, ids):
-        response = None
-        for batch in batches(ids, 100):
-            response = await self.request('POST', f'/playlists/{playlist_id}/items',
-                                          json={'uris': [f'spotify:track:{value}' for value in batch]})
-        return response.json().get('snapshot_id') if response else None
+        return await self.insert(playlist_id, ids)
 
 
 class YouTubeDestination:
     def __init__(self, api):
         self.api = api
+        self._likes = None
 
     async def search(self, track):
         results = await ytmusic.call('tra cứu bài hát', self.api.search,
                                     f'{catalog_title(track.title)} {track.artist or ""}', filter='songs', limit=8)
+        return self._candidates(results)
+
+    async def search_fallback(self, track):
+        results = await ytmusic.call('tra cứu video âm nhạc', self.api.search,
+                                    f'{catalog_title(track.title)} {track.artist or ""}', filter='videos', limit=8)
+        return self._candidates(results, official_video=True)
+
+    @staticmethod
+    def _candidates(results, *, official_video=False):
+        if not isinstance(results, list):
+            raise ProviderResponseError('YouTube Music trả về kết quả tìm kiếm không hợp lệ.')
         return [
             (item['videoId'], item.get('title'), artist_names(item.get('artists')),
-             (item.get('duration_seconds') or 0) * 1000 or None, None)
-            for item in results if item.get('videoId')
+             ytmusic.duration_ms(item), None)
+            for item in results if isinstance(item, dict) and item.get('videoId')
+            and (not official_video or item.get('videoType') in ('MUSIC_VIDEO_TYPE_ATV', 'MUSIC_VIDEO_TYPE_OMV'))
         ]
 
     async def account(self):
@@ -215,15 +230,20 @@ class YouTubeDestination:
     async def apply_likes(self, ids, journal):
         from ytmusicapi import LikeStatus
 
-        existing = await self.liked_ids()
+        if self._likes is None:
+            self._likes = await self.liked_ids()
         entries = []
         for video_id in ids:
-            if video_id in existing:
+            if video_id in self._likes:
                 continue
             entry = journal.record('likes', [video_id])
             await ytmusic.call('ghi lượt thích', self.api.rate_song, video_id, LikeStatus.LIKE)
+            journal.checkpoint(entry, {'accepted': True})
             entries.append((entry, video_id))
+        if not entries:
+            return journal.stats['liked_added']
         observed = await self.liked_ids()
+        self._likes = observed
         for entry, video_id in entries:
             if video_id in observed:
                 journal.confirm(entry)
@@ -231,20 +251,28 @@ class YouTubeDestination:
             raise WriteVerificationError('YouTube Music chưa xác minh được lượt thích sau khi ghi.')
         return journal.stats['liked_added']
 
+    async def recover_likes(self, journal):
+        pending = journal.pending('likes')
+        if not pending:
+            return
+        self._likes = await self.liked_ids()
+        for entry, ids, guard in pending:
+            if guard.get('accepted') and all(video_id in self._likes for video_id in ids):
+                journal.confirm(entry)
+
     async def undo_likes(self, ids):
         from ytmusicapi import LikeStatus
 
         existing = await self.liked_ids()
         for video_id in ids:
             if video_id in existing:
-                await asyncio.to_thread(self.api.rate_song, video_id, LikeStatus.INDIFFERENT)
+                await ytmusic.call('hoàn tác lượt thích', self.api.rate_song, video_id, LikeStatus.INDIFFERENT)
         if set(ids).intersection(await self.liked_ids()):
             raise ValueError('YouTube Music could not verify removed likes.')
 
     async def liked_ids(self):
-        limit = 100000
-        data = await ytmusic.call('đọc lượt thích', self.api.get_liked_songs, limit=limit)
-        if not isinstance(data.get('tracks'), list) or len(data['tracks']) >= limit:
+        data = await ytmusic.call('đọc lượt thích', self.api.get_liked_songs, limit=None)
+        if not isinstance(data.get('tracks'), list):
             raise ValueError('YouTube Music liked tracks could not be verified.')
         return {item.get('videoId') for item in data['tracks']}
 
@@ -260,7 +288,7 @@ class YouTubeDestination:
                 return False
             remove.append(item)
         if remove:
-            await asyncio.to_thread(self.api.remove_playlist_items, playlist_id, remove)
+            await ytmusic.call('hoàn tác bài trong playlist', self.api.remove_playlist_items, playlist_id, remove)
             observed = await self._playlist_rows(playlist_id)
             return not {item.get('setVideoId') for item in observed}.intersection(guard['item_ids'])
         return True
@@ -282,14 +310,19 @@ class YouTubeDestination:
         return [row.get('videoId') for row in await self._playlist_rows(playlist_id)]
 
     async def append(self, playlist_id, ids):
-        before = {item.get('setVideoId') for item in await self._playlist_rows(playlist_id)}
-        for batch in batches(ids, 100):
-            result = await ytmusic.call('thêm bài vào playlist', self.api.add_playlist_items, playlist_id, batch,
-                                        duplicates=True)
-            if not isinstance(result, dict) or result.get('status') != 'STATUS_SUCCEEDED':
-                raise ValueError('YouTube Music did not confirm the track batch.')
-        added = [item for item in await self._playlist_rows(playlist_id) if item.get('setVideoId') not in before]
-        return [item['setVideoId'] for item in added] if (
-            [item.get('videoId') for item in added] == ids and all(item.get('setVideoId') for item in added)
-        ) else None
+        result = await ytmusic.call('thêm bài vào playlist', self.api.add_playlist_items, playlist_id, ids,
+                                    duplicates=True)
+        if not isinstance(result, dict) or result.get('status') != 'STATUS_SUCCEEDED':
+            raise WriteVerificationError('YouTube Music chưa xác nhận lô bài đã thêm.')
+        rows = result.get('playlistEditResults') or []
+        if (len(rows) == len(ids) and all(isinstance(row, dict) and row.get('setVideoId')
+                and row.get('videoId') == video_id for row, video_id in zip(rows, ids))):
+            return [row['setVideoId'] for row in rows]
+        return None
 
+    async def verify_playlist(self, playlist_id, expected, receipts):
+        rows = await self._playlist_rows(playlist_id)
+        if [row.get('videoId') for row in rows] != expected:
+            return False
+        seen = [row.get('setVideoId') for row in rows]
+        return bool(receipts and seen[-len(receipts):] == receipts and len(set(receipts)) == len(receipts))

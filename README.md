@@ -128,7 +128,7 @@ python3 -m pytest -q tests
 - `docker system prune` can delete resources used by other projects: do not run it on a shared server. Use `docker image prune` only after reviewing image usage.
 - Monitor with `docker stats music-sync-hub`, `du -sh data`, `docker compose logs --tail 50 api`.
 - **Sync Now** triggers `POST /v1/sync/all` or `POST /v1/sync/{provider}` (HTTP 202), status at `GET /v1/sync/status`, per-job status at `/v1/sync/jobs/{job_id}`. Manual/scheduled polling share a single queue and duplicate jobs are coalesced.
-- With `WRITE_ENABLED=false` this runs in read-only mode. With writes enabled, only reviewed Spotify–YouTube Music additions are executed. `DELETE_MODE=auto` still controls removal detection only.
+- The reviewed additions writer requires `WRITE_ENABLED=true`. Direct transfer has its own `AUTO_TRANSFER_ENABLED` switch. With writes enabled, only reviewed Spotify–YouTube Music additions are executed. `DELETE_MODE=auto` still controls removal detection only.
 
 ## Botkeep Cloud (native Python, no Docker)
 
@@ -143,23 +143,35 @@ YouTube Music browser configuration can be reused. Keep the same persistent
 uses a secure HTTPS cookie valid for 14 days. Existing API clients can continue
 to send `X-API-Key`.
 
-Choose Spotify → YouTube Music, YouTube Music → Spotify, or a two-way transfer.
-Two-way mode reads each library once and copies additions in both directions from
-those initial snapshots. Removing a track from just one service does not remove it
-from the other and a later run may restore it. Use **Đồng bộ ngay** or save a
-schedule to repeat the selected mode every ten minutes. The dashboard provides
-paginated track results and reasons for the latest transfer. Native likes and playlist tracks are copied separately. For an owned
-playlist, Sync-Music links an unambiguous same-name eligible playlist or creates a
-private one. Spotify destinations must be private and non-collaborative.
-Extra destination tracks keep their order. New tracks are appended in source
-order. Providers apply their own timestamps to new likes.
+Choose Spotify → YouTube Music, YouTube Music → Spotify, or both directions.
+Once Apple Music is connected, it can also supply user-owned playlists in the same
+schedule or in a separate direction to either service. Set the optional
+`APPLE_FAVORITES_PLAYLIST_ID` to the library ID of the Apple Favorites playlist
+if your account exposes its items. Apple library songs are separate from
+Favorites. Apple is a source only.
 
-A direct sync works through the full library. Writes are batched, including up
-to 100 tracks per playlist request. On a Spotify rate limit the active run
-waits for `Retry-After`, then continues automatically. After a restart it reuses
-the initial snapshots, saved matches and verified changes. The final dashboard
-summary shows tracks without a match and items or playlists that need review.
-Apple Music remains available for library reads and manual export.
+Use **Đồng bộ ngay** or enable automatic checks. The first repeat check is after
+10 minutes. Identical observations increase the interval up to four hours. The
+worker skips the matching and writing phases when the observed library is
+unchanged and the previous results are current. Spotify playlist entries are
+reused by playlist version for up to 24 hours. YouTube Music still needs library
+reads to detect external changes.
+
+Each transfer lists tracks by playlist and direction, with an option to review
+ambiguous matches. The dashboard shows the next check, quota waits, past runs
+and API call counts. Native likes and playlist tracks are copied separately.
+Sync-Music links an eligible same-name playlist when unique or creates a private
+one. Spotify destinations must be private and non-collaborative. When the
+existing Spotify track order is already a subsequence of the source, missing
+tracks can be inserted at their source positions. Otherwise existing order is
+preserved and additions are appended. New native likes get provider timestamps.
+
+A transfer works through the full library in API-sized batches. Spotify and
+YouTube Music waits respect the provider retry time. Import jobs, direct
+snapshots and write receipts persist across restarts. An unresolved playlist
+write is held for review to avoid duplicating entries. Two-way mode is additive.
+Unliking one side may cause a later run to restore it. Remote deletion and full
+playlist reordering are outside this mode.
 
 Undo is available for direct transfers that recorded verified additions. Undo
 processes the latest outstanding run per destination and pauses the schedule.

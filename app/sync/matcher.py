@@ -47,6 +47,10 @@ def _fold(value):
                    if not unicodedata.combining(char))
 
 
+def search_title(title):
+    return _fold(catalog_title(title))
+
+
 def _artists(value):
     return tuple(dict.fromkeys(
         artist for name in ARTIST_SEPARATOR.split(value or '')
@@ -67,7 +71,7 @@ def _catalog_score(track, title, artist, duration, isrc):
     gap = abs(track.duration_ms - duration) if track.duration_ms and duration else None
     if normalized(source_title) == normalized(target_title) and set(left) == set(right):
         if gap is None:
-            return 1 if normalized(track.title) == normalized(title) else 0
+            return 0
         return 3 if gap <= 5000 else 0
     if gap is None or gap > 3500 or _fold(source_title) != _fold(target_title):
         return 0

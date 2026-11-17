@@ -1,7 +1,10 @@
 from datetime import datetime, timezone, timedelta
+import re
+
 import httpx
 import jwt
-from .base import Item, NotConfigured
+from . import requests_log
+from .base import Item, NotConfigured, ProviderResponseError
 from ..config import settings
 from ..provider_tokens import load_token
 
@@ -48,45 +51,68 @@ async def verify_token(token: str) -> None:
 
 async def fetch():
     headers = headers_for(user_token())
-    async with httpx.AsyncClient(timeout=35,headers=headers) as client:
+    async with httpx.AsyncClient(timeout=35, headers=headers) as client:
         async def paged(path):
-            result=[]
-            url=f'{API}/{path}'
+            result, seen = [], set()
+            url = f'{API}/{path}'
             while url:
-                r=await client.get(url)
-                r.raise_for_status()
-                d=r.json()
-                if not isinstance(d.get('data'),list): raise ValueError('Apple pagination incomplete')
-                result.extend(d['data'])
-                next_url=d.get('next')
-                if next_url and next_url.startswith('/'):
-                    url='https://api.music.apple.com'+next_url
-                elif next_url and next_url.startswith('https://api.music.apple.com/'):
-                    url=next_url
+                if url in seen:
+                    raise ProviderResponseError('Apple Music trả về trang trùng lặp.')
+                seen.add(url)
+                response = await client.get(url)
+                requests_log.record('apple', 'read', response.status_code)
+                response.raise_for_status()
+                data = response.json()
+                if not isinstance(data.get('data'), list):
+                    raise ProviderResponseError('Apple Music thiếu dữ liệu phân trang.')
+                result.extend(data['data'])
+                next_url = data.get('next')
+                if next_url and next_url.startswith('/v1/'):
+                    url = 'https://api.music.apple.com' + next_url
+                elif next_url and next_url.startswith(f'{API}/'):
+                    url = next_url
                 elif next_url:
-                    raise ValueError('Unsafe Apple pagination next URL')
-                else: url=None
+                    raise ProviderResponseError('Apple Music trả về đường dẫn phân trang không hợp lệ.')
+                else:
+                    url = None
             return result
-        # Apple Library != Apple Favorites. Keep source scopes semantically distinct.
-        songs=await paged('me/library/songs')
-        playlists=await paged('me/library/playlists')
-        out={'library':[],'owned_playlist':[]}
-        for s in songs:
-            a=s.get('attributes') or {}
-            if not s.get('id'):continue
-            out['library'].append(Item('library',s['id'],a.get('name') or '',artist=a.get('artistName'),album=a.get('albumName'),duration_ms=a.get('durationInMillis'),isrc=a.get('isrc'),raw={'playParams':a.get('playParams')}))
-        for p in playlists:
-            a=p.get('attributes') or {}
-            if not p.get('id'):continue
-            pid=p['id']
-            out['owned_playlist'].append(Item('owned_playlist',pid,a.get('name') or '',kind='playlist'))
-            items=await paged(f'me/library/playlists/{pid}/tracks')
-            scope=f'playlist:{pid}'
-            out[scope]=[]
-            occurrences={}
-            for pos,t in enumerate(items):
-                attr=t.get('attributes') or {}
-                if not t.get('id'): continue
-                occurrences[t["id"]]=occurrences.get(t["id"],0)+1
-                out[scope].append(Item(scope,f"{t['id']}#{occurrences[t['id']]}",attr.get('name') or '',artist=attr.get('artistName'),album=attr.get('albumName'),duration_ms=attr.get('durationInMillis'),isrc=attr.get('isrc'),raw={'track_id':t['id'],'position':pos}))
+
+        songs = await paged('me/library/songs')
+        playlists = await paged('me/library/playlists')
+        out = {'library': [], 'liked': [], 'owned_playlist': []}
+        for position, song in enumerate(songs):
+            out['library'].append(track_item('library', song, position))
+        favorites = settings.apple_favorites_playlist_id
+        if favorites:
+            if not re.fullmatch(r'[A-Za-z0-9._-]{1,160}', favorites):
+                raise NotConfigured('Mã playlist Favorites của Apple Music không hợp lệ.')
+            items = await paged(f'me/library/playlists/{favorites}/tracks')
+            added = set()
+            for position, song in enumerate(items):
+                item = track_item('liked', song, position)
+                if item.remote_id not in added:
+                    out['liked'].append(item)
+                    added.add(item.remote_id)
+        for playlist in playlists:
+            attributes = playlist.get('attributes') or {}
+            playlist_id = playlist.get('id')
+            if not playlist_id or not attributes.get('canEdit') or playlist_id == favorites:
+                continue
+            items = await paged(f'me/library/playlists/{playlist_id}/tracks')
+            scope = f'playlist:{playlist_id}'
+            out['owned_playlist'].append(Item('owned_playlist', playlist_id, attributes.get('name') or '', kind='playlist'))
+            out[scope] = [track_item(scope, item, position) for position, item in enumerate(items)]
         return out
+
+
+def track_item(scope, song, position):
+    attrs = song.get('attributes') or {}
+    track_id = song.get('id')
+    title = attrs.get('name') or ''
+    if not track_id or song.get('type') not in (None, 'songs', 'library-songs'):
+        return Item(scope, f'unavailable:{position}', title or 'Bài không khả dụng',
+                    raw={'position': position, 'unavailable': True})
+    remote_id = f'{track_id}#{position}' if scope.startswith('playlist:') else track_id
+    return Item(scope, remote_id, title, artist=attrs.get('artistName'), album=attrs.get('albumName'),
+                duration_ms=attrs.get('durationInMillis'), isrc=attrs.get('isrc'),
+                raw={'track_id': track_id, 'position': position, 'added_at': attrs.get('dateAdded')})

@@ -36,6 +36,15 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monos
 .result-group li{padding:10px 0;border-top:1px solid var(--border);overflow-wrap:anywhere}
 .result-group li strong,.result-group li small{display:block}
 .result-group .flex{margin-bottom:0}
+dialog{width:min(560px,calc(100vw - 28px));max-height:85dvh;overflow:auto;padding:20px;border:1px solid var(--border);border-radius:16px;background:var(--panel);color:var(--ink)}
+dialog::backdrop{background:#080a0ed0}
+#matchChoices{display:grid;gap:10px}
+#matchChoices button{text-align:left;overflow-wrap:anywhere}
+#runHistory{width:min(100%,420px);text-overflow:ellipsis}
+.progress-steps{display:flex;gap:8px;flex-wrap:wrap;margin:0 0 8px;padding:0;list-style:none}
+.progress-steps li{padding:2px 8px;border:1px solid var(--border);border-radius:8px;color:var(--muted)}
+.progress-steps [aria-current="step"]{border-color:var(--accent);color:var(--ink)}
+
 [hidden]{display:none!important}
 @media(max-width:760px){.providers-grid{grid-template-columns:1fr}.provider-status{min-height:initial}}
 </style></head>
@@ -59,14 +68,21 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monos
       <option value="ytmusic:spotify">YouTube Music → Spotify</option>
       <option value="spotify:ytmusic">Spotify → YouTube Music</option>
       <option value="both:both">Spotify ↔ YouTube Music</option>
+      <option value="apple:spotify">Apple Music → Spotify</option>
+      <option value="apple:ytmusic">Apple Music → YouTube Music</option>
+      <option value="all:all">Spotify ↔ YouTube Music + nguồn Apple Music</option>
     </select>
   </label>
-  <label class="inline"><input id="schedule" type="checkbox">Tự đồng bộ theo hướng này mỗi 10 phút</label>
+  <label class="inline"><input id="schedule" type="checkbox">Tự kiểm tra theo mức thay đổi của thư viện</label>
   <div class="flex"><button id="runDirect" class="primary" disabled>Đồng bộ ngay</button><button id="saveSchedule" disabled>Lưu lịch</button></div>
   <p id="directHelp" class="muted"></p>
   <p id="directMessage" role="status"></p>
   <div class="jobbox" id="directJob" hidden>
     <p id="directPhase" aria-live="polite"></p>
+    <ol id="progressSteps" class="progress-steps" aria-label="Các bước đồng bộ">
+      <li data-step="read">Đọc</li><li data-step="match">Ghép</li>
+      <li data-step="write">Ghi và xác minh</li>
+    </ol>
     <progress id="directProgress" aria-label="Tiến độ đồng bộ"></progress>
     <p id="directResult" class="muted"></p>
   </div>
@@ -77,7 +93,10 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monos
   <ul id="undoHistory"></ul>
 </section>
 <details id="directItemsPanel" class="panel">
-  <summary>Kết quả theo playlist · lượt đồng bộ gần nhất</summary>
+  <summary>Kết quả theo playlist</summary>
+  <label class="choose" for="runHistory">Lượt đồng bộ
+    <select id="runHistory"><option value="">Kết quả mới nhất</option></select>
+  </label>
   <div class="flex">
     <label for="itemStatus">Trạng thái</label>
     <select id="itemStatus">
@@ -97,6 +116,12 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monos
     <button id="nextGroups" type="button" disabled>Nhóm sau</button>
   </div>
 </details>
+<dialog id="matchDialog" aria-labelledby="matchHeading">
+  <form method="dialog"><button>Đóng</button></form>
+  <h2 id="matchHeading">Chọn bản ghi</h2>
+  <p id="matchMessage" role="status"></p>
+  <div id="matchChoices"></div>
+</dialog>
 <section id="providers"><h2>Dịch vụ âm nhạc</h2>
 <div class="providers-grid">
 <article class="provider" id="spotifyCard">
@@ -110,13 +135,17 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monos
 <a id="ytmusicLink" target="_blank" rel="noopener noreferrer" hidden>Mở Google để nhập mã</a>
 <p id="ytmusicMessage" role="status"></p>
 <p id="ytmusicHelp" class="muted">Đặt tệp ytmusicapi tại <code>private/ytmusic_browser.json</code> trên máy chủ.</p>
-</article><article class="provider" id="appleCard"><h3>Apple Music</h3><p class="provider-status" id="appleStatus"></p>
+</article><article class="provider" id="appleCard"><h3>Apple Music</h3><p class="provider-status" id="appleStatus"></p><p class="muted" id="appleCapabilities"></p>
 <button id="appleAuthorize" disabled>Kết nối Apple Music</button>
 <a id="appleLink" target="_blank" rel="noopener noreferrer" hidden>Mở MusicKit để cấp quyền</a>
 <p id="appleMessage" role="status"></p>
 <p id="appleHelp" class="muted">Đặt khóa MusicKit và Music User Token trong <code>private/</code>, rồi cấu hình <code>APPLE_TEAM_ID</code> và <code>APPLE_KEY_ID</code>.</p>
 </article></div>
 </section>
+<details class="panel" id="requestPanel">
+  <summary>Lượt gọi API trong 7 ngày</summary>
+  <ul id="providerRequests"></ul>
+</details>
 <details class="panel"><summary>Nhập dữ liệu về máy chủ</summary>
 <div class="flex"><button data-provider="all">Tất cả</button><button data-provider="spotify">Spotify</button><button data-provider="ytmusic">YouTube Music</button><button data-provider="apple">Apple Music</button></div>
 <p id="message" role="status"></p><div id="imports"></div></details>
@@ -170,7 +199,8 @@ async function update(){
   if (!connected || refreshing) return;
   refreshing=true;
   try {
-  const [accounts,jobs,config,direct]=await Promise.all([request('/v1/accounts'),request('/v1/sync/status'),request('/v1/config'),request('/v1/direct-sync')]);
+  const {accounts,jobs,config,direct}=await request('/v1/overview');
+  latestDirect=[direct,config];
   if (!connected) return;
   renderDirect(direct,config);
   renderImports(jobs);
@@ -180,6 +210,9 @@ async function update(){
   $('appleAuthorize').disabled=!config.apple_oauth_configured;
   $('ytmusicHelp').hidden=config.ytmusic_oauth_configured;
   $('appleHelp').hidden=config.apple_oauth_configured;
+  $('appleCapabilities').textContent=config.apple_favorites_configured
+    ? 'Nguồn đồng bộ playlist và playlist Favorites đã cấu hình.'
+    : 'Nguồn đồng bộ playlist. Chọn ID playlist Favorites trên máy chủ để chuyển bài yêu thích.';
   $('spotifyRedirect').hidden=!config.spotify_redirect_uri;
   $('spotifyUri').textContent=config.spotify_redirect_uri;
   for (const provider of ['spotify','ytmusic','apple']) {
@@ -198,11 +231,14 @@ async function update(){
         ? 'Spotify giới hạn yêu cầu. Tự thử lại từ '+retryTime(retryAt)
         : status==='Đã cấu hình, chờ nhập lần đầu' ? 'Chờ nhập thư viện' : status);
     }
+    if(provider==='ytmusic' && config.ytmusic_retry_at && config.provider_ready.ytmusic)
+      status='Đã kết nối · Chờ YouTube Music tới '+retryTime(config.ytmusic_retry_at);
     $(provider+'Status').textContent=status;
     $(provider+'Card').dataset.connected=String(provider==='spotify' ? config.provider_ready.spotify : account?.status==='connected');
   }
   $('status').textContent=JSON.stringify({mode:config.write_enabled?'REVIEWED ADDITIONS':direct.enabled?'DIRECT TRANSFER':'READ-ONLY',baseline_approved:config.baseline_approved,poll_minutes:config.poll_minutes,accounts,jobs,direct_sync:direct.job},null,2);
-  let busy=Object.values(jobs).some(x=>x.state==='queued'||x.state==='running');
+  const busy=Object.values(jobs).some(x=>x.state==='queued'||x.state==='running');
+  refreshDelay=busy || ['queued','running'].includes(direct.job?.state) ? 3500 : 20000;
   document.querySelectorAll('button[data-provider]').forEach(b=>{
     b.disabled=busy || (b.dataset.provider==='all' ? !Object.values(config.provider_ready).some(Boolean)
       : !config.provider_ready[b.dataset.provider]);
@@ -241,18 +277,23 @@ $('logout').onclick=async()=>{
   catch(e) { $('directMessage').textContent=e.message; }
 };
 const names={spotify:'Spotify',ytmusic:'YouTube Music',apple:'Apple Music'};
-const syncLabel=(source,target)=>source==='both' ? 'Spotify ↔ YouTube Music' : names[source]+' → '+names[target];
+const syncLabel=(source,target)=>source==='both' ? 'Spotify ↔ YouTube Music'
+  : source==='all' ? 'Spotify ↔ YouTube Music + nguồn Apple Music' : names[source]+' → '+names[target];
 const stages={waiting:'Đang chờ',check_permissions:'Đang kiểm tra quyền ghi',read_source:'Đang đọc thư viện nguồn',read_destination:'Đang đọc thư viện đích',
   match_tracks:'Đang ghép bài hát', write_collections:'Đang cập nhật lượt thích và playlist',undo:'Đang hoàn tác'};
 const states={idle:'Chưa chạy',queued:'Đang chờ',running:'Đang nhập',completed:'Hoàn tất',failed:'Gặp lỗi',
   interrupted:'Bị gián đoạn',partial:'Hoàn tất một phần'};
 const count=(v,n)=>v ? v+' '+n : '';
+function directionReady(config,source,target){
+  const providers=source==='all'?['apple','spotify','ytmusic']:source==='both'?['spotify','ytmusic']:[source,target];
+  return providers.every(provider=>config.provider_ready[provider]);
+}
 const retryTime=seconds=>new Date(seconds*1000).toLocaleString('vi-VN',{dateStyle:'short',timeStyle:'short'});
 function showProgress(el,done,total) {
   if(total){el.max=total;el.value=done;}else{el.removeAttribute('value');}
 }
 function renderDirect(data,config) {
-  const {job,rule,history,enabled}=data;
+  const {job,rule,history,enabled,next_check_at}=data;
   updateItemView(job);
   const ruleKey=JSON.stringify(rule);
   if ((!ruleDirty || job?.stage.startsWith('undo') || job?.result.schedule_paused) && ruleKey!==ruleApplied) {
@@ -261,18 +302,32 @@ function renderDirect(data,config) {
     ruleDirty=false;
     ruleApplied=ruleKey;
   }
-  const ready=config.provider_ready.spotify && config.provider_ready.ytmusic;
+  for(const option of $('direction').options){
+    const [source,target]=option.value.split(':');
+    option.disabled=!directionReady(config,source,target);
+  }
+  const [source,target]=$('direction').value.split(':');
+  const ready=directionReady(config,source,target);
   const busy=job?.state==='queued'||job?.state==='running';
   $('runDirect').disabled=!enabled || !ready || busy || directBusy;
   $('saveSchedule').disabled=!enabled || busy || directBusy || (!ready && $('schedule').checked);
   $('schedule').disabled=!enabled || busy || directBusy;
   $('directHelp').textContent=!enabled ? 'Bật AUTO_TRANSFER_ENABLED trên Botkeep, rồi cấp lại quyền Spotify.'
-    : !ready ? 'Kết nối Spotify và YouTube Music để đồng bộ.'
-    : rule?.scheduled ? 'Lịch đang bật · '+syncLabel(rule.source,rule.target) : '';
+    : !ready ? 'Kết nối các dịch vụ trong hướng đã chọn.'
+    : rule?.scheduled ? 'Lịch đang bật · '+syncLabel(rule.source,rule.target)
+      +(next_check_at && !busy?' · Kiểm tra lại lúc '+retryTime(next_check_at):'') : '';
   $('directJob').hidden=!job;
   if(job){
-    const phase=busy && job.retry_at ? 'Đang chờ Spotify' : busy ? stages[job.stage] : states[job.state];
-    const direction=job.source==='both'&&busy&&job.result.active_source
+    const waiting=job.retry_provider||'spotify';
+    const phase=busy && job.retry_at ? 'Đang chờ '+names[waiting]
+      +(waiting==='spotify'&&config.spotify_limit_reason==='quota'?' do hết quota':'')
+      : job.stage==='no_changes' ? 'Thư viện không đổi' : busy ? stages[job.stage] : states[job.state];
+    const step=job.stage==='match_tracks'?'match':job.stage==='write_collections'?'write':'read';
+    $('progressSteps').hidden=!busy || job.stage==='undo';
+    $('progressSteps').querySelectorAll('li').forEach(li=>{
+      if(li.dataset.step===step)li.setAttribute('aria-current','step');else li.removeAttribute('aria-current');
+    });
+    const direction=['both','all'].includes(job.source)&&busy&&job.result.active_source
       ? syncLabel(job.result.active_source,job.result.active_target) : syncLabel(job.source,job.target);
     const text=(phase||states[job.state])+' · '+direction
       +(busy&&job.total?' · '+job.done+'/'+job.total:'');
@@ -290,6 +345,7 @@ function renderDirect(data,config) {
     const retry=busy && job.retry_at ? 'Tự tiếp tục từ '+retryTime(job.retry_at) : '';
     const error=r.error && stages[job.stage] ? `${stages[job.stage]} · ${r.error}` : r.error;
     $('directResult').textContent=[error,...pieces,
+      r.apple_error?'Apple Music · '+r.apple_error:'',
       retry || (r.spotify_rate_limited?'Spotify đang giới hạn yêu cầu. Sync-Music sẽ tiếp tục ở lượt sau.':''),
       r.schedule_paused?'Đã tạm dừng lịch.':''].filter(Boolean).join(' · ');
     if(!busy && $('directMessage').textContent==='Đã xếp hàng.') $('directMessage').textContent='';
@@ -328,6 +384,7 @@ function resultQuery(offset,limit){
   const query=new URLSearchParams({offset,limit});
   const status=$('itemStatus').value;
   if(status)query.set('status',status);
+  if($('runHistory').value)query.set('job_id',$('runHistory').value);
   return query;
 }
 function pageButton(label){
@@ -367,9 +424,10 @@ function updateGroup(group,meta){
 
 async function loadTracks(group){
   if(!visibleResults() || !group.panel.open || !group.panel.isConnected)return;
-  const version=++group.request, offset=group.offset, {source,key}=group.meta;
+  const version=++group.request, offset=group.offset, {source,target,key}=group.meta;
   const query=resultQuery(offset,trackPageSize);
   query.set('source',source);
+  query.set('target',target);
   query.set('collection_key',key);
   const current=()=>version===group.request && visibleResults() && group.panel.open && group.panel.isConnected;
   try{
@@ -384,6 +442,12 @@ async function loadTracks(group){
       title.textContent=[item.title||'Bài chưa có tên',item.artist].filter(Boolean).join(' · ');
       details.textContent=[itemLabels[item.status],item.reason].filter(Boolean).join(' · ');
       row.append(title,details);
+      if(item.status==='unmatched' && /^[A-Za-z0-9._-]{1,128}$/.test(item.source_id||'')){
+        const button=document.createElement('button');
+        button.textContent='Xem bản ghép';
+        button.onclick=()=>void chooseMatch(item);
+        row.append(button);
+      }
       return row;
     });
     group.items.replaceChildren(...rows);
@@ -415,7 +479,7 @@ async function loadGroups(){
     }
     const keys=new Set();
     for(const [index,meta] of groups.entries()){
-      const key=JSON.stringify([job_id,meta.source,meta.key]);
+      const key=JSON.stringify([job_id,meta.source,meta.target,meta.key]);
       keys.add(key);
       let group=resultGroups.get(key);
       if(!group){
@@ -440,12 +504,70 @@ async function loadGroups(){
 }
 
 function updateItemView(job){
-  const id=job?.stage.startsWith('undo')?itemJob:job?.job_id||'';
+  if($('runHistory').value)return;
+  const id=job?.stage.startsWith('undo')||job?.stage==='no_changes'?itemJob:job?.job_id||'';
   if(id!==itemJob){itemJob=id;groupOffset=0;clearGroups();}
   const version=JSON.stringify([itemJob,job?.stage,job?.updated_at,job?.done,job?.state]);
   if(version!==itemVersion){itemVersion=version;void loadGroups();}
 }
-resultPanel.addEventListener('toggle',loadGroups);
+async function loadRunHistory(){
+  if(!visibleResults())return;
+  try{
+    const runs=await request('/v1/direct-sync/history');
+    const select=$('runHistory'), selected=select.value;
+    const options=runs.map(run=>new Option(
+      retryTime(run.finished_at)+' · '+syncLabel(run.source,run.target)+' · '+states[run.state],run.job_id));
+    select.replaceChildren(new Option('Kết quả mới nhất',''),...options);
+    if(runs.some(run=>run.job_id===selected))select.value=selected;
+  }catch(error){$('itemSummary').textContent=error.message;}
+}
+resultPanel.addEventListener('toggle',()=>{void loadRunHistory();void loadGroups();});
+$('runHistory').onchange=()=>{groupOffset=0;clearGroups();void loadGroups();};
+
+async function chooseMatch(item){
+  const dialog=$('matchDialog'), message=$('matchMessage'), list=$('matchChoices');
+  const fields={source:item.source,target:item.target,source_id:item.source_id};
+  $('matchHeading').textContent=item.title||'Chọn bản ghi';
+  message.textContent='Đang tải ứng viên…';
+  list.replaceChildren();
+  dialog.showModal();
+  try{
+    const matches=await request('/v1/direct-sync/candidates?'+new URLSearchParams(fields));
+    message.textContent=matches.length?'So sánh nghệ sĩ, phiên bản và thời lượng trước khi chọn.'
+      :'Chưa có ứng viên. Hãy thử lại sau khi làm mới kết quả tra cứu.';
+    for(const match of matches){
+      const button=document.createElement('button');
+      const seconds=Math.round((match.duration_ms||0)/1000);
+      const duration=seconds?Math.floor(seconds/60)+':'+String(seconds%60).padStart(2,'0'):'';
+      button.textContent=[match.title,match.artist,duration,match.isrc].filter(Boolean).join(' · ');
+      button.onclick=async()=>{
+        button.disabled=true;
+        try{
+          await request('/v1/direct-sync/candidates','POST',{...fields,target_id:match.id});
+          message.textContent='Đã lưu bản ghép. Lượt đồng bộ tiếp theo sẽ áp dụng.';
+          list.replaceChildren();
+        }catch(error){message.textContent=error.message;button.disabled=false;}
+      };
+      list.append(button);
+    }
+  }catch(error){message.textContent=error.message;}
+}
+
+$('requestPanel').addEventListener('toggle',async()=>{
+  if(!$('requestPanel').open || !connected)return;
+  const list=$('providerRequests');
+  const operations={read:'Đọc',search:'Tìm kiếm',write:'Ghi',verify:'Xác minh',authorize:'Cấp quyền'};
+  try{
+    const metrics=await request('/v1/requests');
+    const rows=metrics.map(row=>{
+      const item=document.createElement('li');
+      item.textContent=names[row.provider]+' · '+operations[row.operation]+' · '+row.requests+' lượt'
+        +(row.status>=400?' · HTTP '+row.status:row.status===0?' · lỗi kết nối':'');
+      return item;
+    });
+    list.replaceChildren(...rows);
+  }catch(error){list.textContent=error.message;}
+});
 $('itemStatus').onchange=()=>{groupOffset=0;clearGroups();void loadGroups();};
 $('reloadItems').onclick=loadGroups;
 $('previousGroups').onclick=()=>{groupOffset=Math.max(0,groupOffset-groupPageSize);void loadGroups();};
@@ -651,6 +773,15 @@ async function restoreSession(){
   catch {showSession(false);}
 }
 void restoreSession();
-setInterval(()=>{if(!document.hidden)void update();},4000);
-document.addEventListener('visibilitychange',()=>{if(!document.hidden)void update();});
+let latestDirect;
+$('direction').addEventListener('change',()=>{if(latestDirect)renderDirect(...latestDirect);});
+let refreshDelay=3500, refreshTimer;
+async function refreshVisible(){
+  clearTimeout(refreshTimer);
+  if(document.hidden)return;
+  await update();
+  if(!document.hidden)refreshTimer=setTimeout(refreshVisible,refreshDelay);
+}
+document.addEventListener('visibilitychange',()=>void refreshVisible());
+void refreshVisible();
 </script></body></html>'''

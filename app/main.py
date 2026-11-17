@@ -3,6 +3,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import time
+import json
 from typing import Literal
 from uuid import uuid4
 
@@ -15,16 +16,15 @@ import httpx
 from .config import settings, validate
 from .db import init_db, connect, get_setting, prune_history
 from . import apple_authorization
-from .connectors import apple, google_oauth, spotify
-from .connectors.base import NotConfigured, ProviderResponseError
+from .connectors import apple, google_oauth, requests_log, spotify, ytmusic
+from .connectors.base import Item, NotConfigured, ProviderResponseError
 from .dashboard import HTML
 from .dashboard_session import admin, router as dashboard_session_router
 from .provider_tokens import has_token
-from .sync.engine import POLL_LOCK, poll
-from .sync import direct, direct_results, review, transfer, writer
+from .sync.engine import POLL_LOCK, _canonical, poll
+from .sync import direct, direct_results, review, schedule, transfer, writer
 
 PROVIDERS = ('spotify', 'ytmusic', 'apple')
-scheduler = AsyncIOScheduler(timezone='UTC')
 _jobs: dict[str, dict] = {}
 _active: dict[str, str] = {}
 _tasks: set[asyncio.Task] = set()
@@ -32,10 +32,46 @@ _tasks: set[asyncio.Task] = set()
 def timestamp():
     return datetime.now(timezone.utc).isoformat()
 
+
+def persist_import(job):
+    with connect() as con:
+        con.execute(
+            """INSERT INTO import_jobs VALUES (?,?,?,?) ON CONFLICT(job_id)
+               DO UPDATE SET state=excluded.state,payload_json=excluded.payload_json""",
+            (job['job_id'], job['provider'], job['state'], json.dumps(job)),
+        )
+
+
+def start_import(job):
+    job_id, provider = job['job_id'], job['provider']
+    _jobs[job_id] = job
+    _active[provider] = job_id
+    task = asyncio.create_task(_run_job(job_id, provider))
+    _tasks.add(task)
+    task.add_done_callback(_tasks.discard)
+
+
+def recover_imports():
+    _jobs.clear()
+    _active.clear()
+    with connect() as con:
+        rows = con.execute(
+            """SELECT payload_json FROM import_jobs WHERE state IN ('queued','running') OR job_id IN (
+                SELECT job_id FROM import_jobs ORDER BY rowid DESC LIMIT 30)
+               ORDER BY rowid DESC""",
+        ).fetchall()
+    for row in reversed(rows):
+        job = json.loads(row['payload_json'])
+        if job['state'] in ('queued', 'running'):
+            start_import(job)
+        else:
+            _jobs[job['job_id']] = job
+
 async def _run_job(job_id: str, provider: str):
     job = _jobs[job_id]
     job['state'] = 'running'
-    job['started_at'] = timestamp()
+    job.setdefault('started_at', timestamp())
+    persist_import(job)
     try:
         while True:
             result = await poll(provider)
@@ -43,16 +79,21 @@ async def _run_job(job_id: str, provider: str):
             if retry_at is None:
                 break
             job['retry_at'] = retry_at
+            persist_import(job)
             # poll() releases its lock before returning a cooldown.
             await asyncio.sleep(max(0, retry_at - time.time()))
+        if job['trigger'] == 'scheduled':
+            schedule.record(provider, poll_minutes()[provider], unchanged=result.get('unchanged', False))
         job['result'] = result
         job['state'] = 'failed' if 'error' in result else 'completed'
     except Exception as exc:
         job['result'] = {'error': f'{type(exc).__name__}: {str(exc)[:250]}'}
         job['state'] = 'failed'
     finally:
-        job.pop('retry_at', None)
-        job['finished_at'] = timestamp()
+        if job['state'] in ('completed', 'failed'):
+            job.pop('retry_at', None)
+            job['finished_at'] = timestamp()
+            persist_import(job)
         if _active.get(provider) == job_id:
             del _active[provider]
         # Keep up to 30 recent jobs in RAM (past results persist in SQLite).
@@ -66,19 +107,30 @@ def submit(provider: str, trigger='manual'):
     if provider in _active:
         return {'job_id': _active[provider], 'provider': provider, 'already_running': True}
     job_id = uuid4().hex
-    _jobs[job_id] = {'job_id': job_id, 'provider': provider, 'trigger': trigger,
-                     'state': 'queued', 'requested_at': timestamp()}
-    _active[provider] = job_id
-    task = asyncio.create_task(_run_job(job_id, provider))
-    _tasks.add(task)
-    task.add_done_callback(_tasks.discard)
+    job = {'job_id': job_id, 'provider': provider, 'trigger': trigger,
+           'state': 'queued', 'requested_at': timestamp()}
+    persist_import(job)
+    start_import(job)
     return {'job_id': job_id, 'provider': provider, 'already_running': False}
 
-async def scheduled_poll(provider: str):
-    if provider == 'spotify' and direct.ENABLED and direct_schedule_ready(direct.rule()):
-        return  # The direct sync already reads Spotify's library.
-    if provider_ready(provider):
-        submit(provider, 'scheduled')
+def poll_minutes():
+    return {'spotify': settings.spotify_minutes, 'ytmusic': settings.ytm_minutes,
+            'apple': settings.apple_minutes}
+
+
+async def scheduled_checks():
+    rule = direct.rule() if direct.ENABLED else None
+    if rule and rule['source'] == direct.ALL and not provider_ready('apple'):
+        rule = {**rule, 'source': direct.BOTH, 'target': direct.BOTH}
+    ready = direct_schedule_ready(rule)
+    managed = {provider for pair in direct.directions(rule['source'], rule['target'])
+               for provider in pair} if ready else set()
+    now = time.time()
+    if ready and (schedule.next_check('direct') or 0) <= now:
+        direct.submit(rule['source'], rule['target'], scheduled=True)
+    for provider in PROVIDERS:
+        if provider not in managed and provider_ready(provider) and (schedule.next_check(provider) or 0) <= now:
+            submit(provider, 'scheduled')
 
 
 def provider_ready(provider: str) -> bool:
@@ -89,34 +141,28 @@ def provider_ready(provider: str) -> bool:
     return bool(settings.spotify_client_id and settings.spotify_redirect_uri and has_token('spotify'))
 
 def direct_schedule_ready(rule):
-    return rule and rule['scheduled'] and direct.directions(rule['source'], rule['target']) and all(
-        provider_ready(provider) for provider in direct.SERVICES
-    )
-
-
-async def scheduled_direct_sync():
-    rule = direct.rule()
-    if direct_schedule_ready(rule):
-        direct.submit(rule['source'], rule['target'])
+    if not rule or not rule['scheduled']:
+        return False
+    pairs = direct.directions(rule['source'], rule['target'])
+    return bool(pairs) and all(provider_ready(provider) for pair in pairs for provider in pair)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     validate()
     init_db()
+    scheduler = AsyncIOScheduler(timezone='UTC')
+    spotify.enable_pacing(True)
     direct.recover()
-    for provider, minutes in [('spotify', settings.spotify_minutes),
-                              ('ytmusic', settings.ytm_minutes),
-                              ('apple', settings.apple_minutes)]:
-        scheduler.add_job(scheduled_poll, 'interval', minutes=minutes, args=[provider],
-                          id=provider, coalesce=True, max_instances=1, misfire_grace_time=60)
+    recover_imports()
+    scheduler.add_job(scheduled_checks, 'interval', seconds=30, id='library_checks',
+                      coalesce=True, max_instances=1, misfire_grace_time=60)
+    scheduler.add_job(requests_log.flush, 'interval', minutes=1, id='request_metrics',
+                      coalesce=True, max_instances=1)
     scheduler.add_job(prune_history, 'cron', hour=3, minute=25, id='maintenance',
                       coalesce=True, max_instances=1)
     if settings.write_enabled:
         scheduler.add_job(execute_pending, 'interval', minutes=1, id='sync_writer',
-                          coalesce=True, max_instances=1, misfire_grace_time=60)
-    if direct.ENABLED:
-        scheduler.add_job(scheduled_direct_sync, 'interval', minutes=10, id='direct_sync',
                           coalesce=True, max_instances=1, misfire_grace_time=60)
     scheduler.start()
     try:
@@ -128,6 +174,8 @@ async def lifespan(app: FastAPI):
             task.cancel()
         if _tasks:
             await asyncio.gather(*_tasks, return_exceptions=True)
+        spotify.enable_pacing(False)
+        await asyncio.to_thread(requests_log.flush)
 
 app = FastAPI(title='Music Sync Hub', version='0.4.0', lifespan=lifespan,
               docs_url=None, redoc_url=None, openapi_url=None)
@@ -152,14 +200,18 @@ def config():
             'write_enabled': settings.write_enabled, 'baseline_approved': get_setting('baseline_approved') == 'true',
             'provider_ready': {provider: provider_ready(provider) for provider in PROVIDERS},
             'spotify_retry_at': spotify.api_retry_at(),
+            'spotify_limit_reason': get_setting('spotify_limit_reason'),
+            'ytmusic_retry_at': ytmusic.api_retry_at(),
+            'next_checks': {name: schedule.next_check(name) for name in (*PROVIDERS, 'direct')},
             'spotify_redirect_uri': settings.spotify_redirect_uri,
             'ytmusic_oauth_configured': google_oauth.configured(),
+            'apple_favorites_configured': bool(settings.apple_favorites_playlist_id),
             'apple_oauth_configured': apple_authorization.configured(),
             'spotify_oauth_configured': bool(settings.spotify_client_id and settings.spotify_redirect_uri)}
 
 class DirectDirection(BaseModel):
-    source: Literal['spotify', 'ytmusic', 'both']
-    target: Literal['spotify', 'ytmusic', 'both']
+    source: Literal['spotify', 'ytmusic', 'apple', 'both', 'all']
+    target: Literal['spotify', 'ytmusic', 'both', 'all']
 
 
 class DirectRule(DirectDirection):
@@ -171,8 +223,9 @@ def validate_direction(direction):
         raise HTTPException(409, 'Enable AUTO_TRANSFER_ENABLED on the server.')
     if not direct.directions(direction.source, direction.target):
         raise HTTPException(422, 'Choose a valid sync direction.')
-    if not all(provider_ready(provider) for provider in direct.SERVICES):
-        raise HTTPException(409, 'Connect both music services first.')
+    if not all(provider_ready(provider) for pair in direct.directions(direction.source, direction.target)
+               for provider in pair):
+        raise HTTPException(409, 'Kết nối các dịch vụ trong hướng đồng bộ đã chọn.')
 
 
 @app.get('/v1/direct-sync', dependencies=[Depends(admin)])
@@ -186,21 +239,69 @@ DirectItemStatus = Literal['pending', 'deferred', 'unmatched', 'failed', 'synced
 @app.get('/v1/direct-sync/groups', dependencies=[Depends(admin)])
 def direct_groups(
     status: DirectItemStatus | None = None,
+    job_id: str | None = Query(None, max_length=32),
     offset: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
-    return direct_results.list_groups(status, offset, limit)
+    return direct_results.list_groups(status, offset, limit, job_id=job_id)
 
 
 @app.get('/v1/direct-sync/items', dependencies=[Depends(admin)])
 def direct_items(
     status: DirectItemStatus | None = None,
-    source: Literal['spotify', 'ytmusic'] | None = None,
+    job_id: str | None = Query(None, max_length=32),
+    source: Literal['spotify', 'ytmusic', 'apple'] | None = None,
+    target: Literal['spotify', 'ytmusic'] | None = None,
     collection_key: str | None = Query(None, max_length=512),
     offset: int = Query(0, ge=0),
     limit: int = Query(25, ge=1, le=100),
 ):
-    return direct_results.list_items(status, offset, limit, source=source, collection_key=collection_key)
+    return direct_results.list_items(status, offset, limit, source=source,
+                                     target=target, collection_key=collection_key, job_id=job_id)
+
+
+@app.get('/v1/direct-sync/history', dependencies=[Depends(admin)])
+def direct_history():
+    return direct_results.history()
+
+
+@app.get('/v1/requests', dependencies=[Depends(admin)])
+def request_counts():
+    requests_log.flush()
+    return requests_log.recent()
+
+
+class DirectMatch(BaseModel):
+    source: Literal['spotify', 'ytmusic', 'apple']
+    target: Literal['spotify', 'ytmusic']
+    source_id: str = Field(min_length=1, max_length=128)
+    target_id: str = Field(min_length=1, max_length=128)
+
+
+@app.get('/v1/direct-sync/candidates', dependencies=[Depends(admin)])
+def direct_candidates(source: Literal['spotify', 'ytmusic', 'apple'], target: Literal['spotify', 'ytmusic'],
+                      source_id: str = Query(min_length=1, max_length=128)):
+    fields = ('id', 'title', 'artist', 'duration_ms', 'isrc')
+    return [dict(zip(fields, row)) for row in direct_results.options(source, target, source_id)]
+
+
+@app.post('/v1/direct-sync/candidates', dependencies=[Depends(admin)])
+async def choose_direct_candidate(payload: DirectMatch):
+    async with POLL_LOCK:
+        if not direct.directions(payload.source, payload.target):
+            raise HTTPException(422, 'Chọn hai dịch vụ khác nhau.')
+        options = direct_results.options(payload.source, payload.target, payload.source_id)
+        candidate = next((row for row in options if row[0] == payload.target_id), None)
+        if candidate is None:
+            raise HTTPException(409, 'Kết quả tra cứu đã thay đổi. Hãy đồng bộ lại để tải ứng viên mới.')
+        track_id, title, artist, duration, isrc = candidate
+        with connect() as con:
+            _canonical(con, payload.target, Item('catalog', track_id, title or '', artist=artist,
+                                                 duration_ms=duration, isrc=isrc))
+        try:
+            return review.approve(payload.source, 'track', payload.source_id, track_id, target_provider=payload.target)
+        except ValueError as exc:
+            raise HTTPException(409, detail=str(exc)) from exc
 
 
 @app.put('/v1/direct-sync/rule', dependencies=[Depends(admin)])
@@ -250,6 +351,11 @@ def conflicts():
 @app.get('/v1/sync/status', dependencies=[Depends(admin)])
 def sync_status():
     return {p: _jobs[_active[p]] if p in _active else next((v for v in reversed(list(_jobs.values())) if v['provider'] == p), {'state':'idle'}) for p in PROVIDERS}
+
+@app.get('/v1/overview', dependencies=[Depends(admin)])
+def overview():
+    return {'accounts': accounts(), 'jobs': sync_status(), 'config': config(), 'direct': direct.status()}
+
 
 @app.get('/v1/sync/jobs/{job_id}', dependencies=[Depends(admin)])
 def sync_job(job_id: str):
@@ -375,7 +481,8 @@ async def apple_complete(grant: AppleGrant):
 
 async def execute_pending():
     async with POLL_LOCK:
-        await writer.execute_next()
+        if not (direct.ENABLED and (direct.running() or direct_schedule_ready(direct.rule()))):
+            await writer.execute_next()
 
 
 class MatchApproval(BaseModel):
