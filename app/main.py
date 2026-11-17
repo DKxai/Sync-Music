@@ -229,7 +229,7 @@ def sync_job(job_id: str):
 
 @app.post('/v1/sync/all', status_code=202, dependencies=[Depends(admin)])
 async def sync_all():
-    return {'jobs': [submit(p) for p in PROVIDERS]}
+    return {'jobs': [submit(provider) for provider in PROVIDERS if provider_ready(provider)]}
 
 @app.post('/v1/sync/{provider}', status_code=202, dependencies=[Depends(admin)])
 async def sync_now(provider: Literal['spotify', 'ytmusic', 'apple']):

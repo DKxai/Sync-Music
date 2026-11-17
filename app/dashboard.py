@@ -192,7 +192,8 @@ async function update(){
   $('status').textContent=JSON.stringify({mode:config.write_enabled?'REVIEWED ADDITIONS':direct.enabled?'DIRECT TRANSFER':'READ-ONLY',baseline_approved:config.baseline_approved,poll_minutes:config.poll_minutes,accounts,jobs},null,2);
   let busy=Object.values(jobs).some(x=>x.state==='queued'||x.state==='running');
   document.querySelectorAll('button[data-provider]').forEach(b=>{
-    b.disabled=busy || (b.dataset.provider!=='all' && !config.provider_ready[b.dataset.provider]);
+    b.disabled=busy || (b.dataset.provider==='all' ? !Object.values(config.provider_ready).some(Boolean)
+      : !config.provider_ready[b.dataset.provider]);
   });
   } catch(e) { $('status').textContent=e.message; }
     finally { refreshing=false; }

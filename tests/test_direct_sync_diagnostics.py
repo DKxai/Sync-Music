@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
-from app import db
+from app import db, main
 from app.connectors import spotify
 from app.connectors.base import Item
 from app.sync import direct, direct_results, undo
@@ -135,3 +135,24 @@ def test_search_budget_distinguishes_waiting_from_no_match(database, monkeypatch
     assert result == dict(unmatched=1, search_deferred=1)
     assert direct_results.list_items('unmatched', 0, 25)['items'][0]['title'] == 'No match'
     assert direct_results.list_items('deferred', 0, 25)['items'][0]['title'] == 'Not yet searched'
+
+
+def test_sync_all_includes_apple_when_ready(monkeypatch):
+    configured = {'spotify', 'ytmusic'}
+    monkeypatch.setattr(main, 'provider_ready', lambda provider: provider in configured)
+    monkeypatch.setattr(main, 'submit', lambda provider: provider)
+    assert set(asyncio.run(main.sync_all())['jobs']) == configured
+    configured.add('apple')
+    assert set(asyncio.run(main.sync_all())['jobs']) == configured
+
+
+def test_old_spotify_pending_likes_are_cleared_only_if_absent(database):
+    stats = dict(liked_added=0)
+    journal = undo.Journal('old-rejected', 'ytmusic', 'spotify', 'account', stats)
+    journal.record('likes', ['missing'])
+    journal = undo.Journal('old-uncertain', 'ytmusic', 'spotify', 'account', stats)
+    journal.record('likes', ['present'])
+    journal = undo.Journal('old-confirmed', 'ytmusic', 'spotify', 'account', stats)
+    journal.confirm(journal.record('likes', ['unliked-after-sync']))
+    undo.resolve_absent_spotify_likes('account', {'present'})
+    assert {row['job_id'] for row in undo.history()} == {'old-uncertain', 'old-confirmed'}
