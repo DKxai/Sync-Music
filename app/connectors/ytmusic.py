@@ -5,9 +5,11 @@ import time
 from contextvars import ContextVar
 from math import ceil
 
-from requests import Session
+from requests import RequestException, Session
+from requests.structures import CaseInsensitiveDict
 
 from . import requests_log
+from .ytmusic_likes import LikedPlaylistError, read_liked_tracks, signed_in
 from .base import Item, NotConfigured, ProviderResponseError
 from ..config import settings
 from ..provider_tokens import load_token, save_token
@@ -64,6 +66,8 @@ def duration_ms(track):
 
 def client():
     from ytmusicapi import OAuthCredentials, YTMusic
+    from ytmusicapi.exceptions import YTMusicUserError
+    from ytmusicapi.helpers import get_authorization, sapisid_from_cookie
 
     if settings.ytm_client_id and settings.ytm_client_secret:
         token = load_token('ytmusic')
@@ -79,8 +83,22 @@ def client():
                 save_token('ytmusic', token)
             return YTMusic(token, oauth_credentials=credentials, requests_session=MusicSession())
     if not settings.ytm_auth_path.is_file():
-        raise NotConfigured('Connect YouTube Music via OAuth or set private/ytmusic_browser.json')
-    return YTMusic(str(settings.ytm_auth_path), requests_session=MusicSession())
+        raise NotConfigured('Hãy cấu hình Google OAuth hoặc đặt tệp phiên tại private/ytmusic_browser.json trên máy chủ.')
+    try:
+        headers = CaseInsensitiveDict(json.loads(settings.ytm_auth_path.read_text(encoding='utf-8-sig')))
+        if not all(isinstance(v, str) for v in headers.values()):
+            raise ValueError
+        if not headers.get('cookie'):
+            raise ValueError
+        # Browser auth signs the origin on every request. An absent origin otherwise signs "None".
+        if not headers.get('origin') and not headers.get('x-origin'):
+            headers['origin'] = 'https://music.youtube.com'
+        if not headers.get('authorization'):
+            origin = headers.get('origin') or headers['x-origin']
+            headers['authorization'] = get_authorization(sapisid_from_cookie(headers['cookie']) + ' ' + origin)
+        return YTMusic(dict(headers), requests_session=MusicSession())
+    except (OSError, ValueError, TypeError, AttributeError, KeyError, YTMusicUserError):
+        raise NotConfigured('Tệp ytmusic_browser.json không hợp lệ. Tạo lại bằng ytmusicapi browser từ phiên YouTube Music đang đăng nhập.') from None
 
 
 class ImportRequestError(ProviderResponseError):
@@ -89,18 +107,25 @@ class ImportRequestError(ProviderResponseError):
 
 def _read(stage, method, *args, **kwargs):
     from ytmusicapi.exceptions import YTMusicServerError
+    from ytmusicapi.auth.oauth.exceptions import BadOAuthClient, UnauthorizedOAuthClient
 
     try:
         return method(*args, **kwargs)
+    except (BadOAuthClient, UnauthorizedOAuthClient):
+        raise ImportRequestError('Google từ chối cấu hình OAuth. Kiểm tra client ID và cấp lại quyền YouTube Music.') from None
     except YTMusicServerError as exc:
         match = re.match(r'Server returned HTTP ([1-5][0-9]{2})\b', str(exc))
+        if match and match[1] in ('401', '403'):
+            raise ImportRequestError(f'YouTube Music từ chối quyền truy cập (HTTP {match[1]}). Kiểm tra tài khoản và cấp lại quyền hoặc cập nhật tệp phiên.') from None
         detail = f'HTTP {match[1]}' if match else 'YTMusicServerError'
         raise ImportRequestError(f'YouTube Music {stage}: {detail}') from None
     except json.JSONDecodeError:
         raise ImportRequestError(f'YouTube Music {stage}: invalid JSON') from None
-    except ImportRequestError:
+    except RequestException:
+        raise ImportRequestError(f'YouTube Music {stage}: lỗi mạng. Hãy thử lại.') from None
+    except ProviderResponseError:
         raise
-    except (KeyError, IndexError):
+    except (KeyError, IndexError, TypeError, AttributeError):
         raise ImportRequestError(f'YouTube Music {stage}: response missing expected data') from None
     except ValueError:
         raise ImportRequestError(f'YouTube Music {stage}: invalid data') from None
@@ -119,52 +144,29 @@ async def call(stage, method, *args, **kwargs):
             raise ProviderResponseError(f'YouTube Music không trả đủ dữ liệu khi {stage}.') from None
 
 
-def _liked_shelf(api, limit):
-    """Read the LM track shelf independently of optional playlist header metadata."""
-    from ytmusicapi.continuations import CONTINUATION_ITEMS, get_continuation_token
-    from ytmusicapi.navigation import SINGLE_COLUMN_TAB, TWO_COLUMN_RENDERER, nav
-    from ytmusicapi.parsers.playlists import parse_playlist_items
-
-    invalid = 'YouTube Music trả về danh sách bài đã thích chưa đầy đủ. Hãy kiểm tra kết nối rồi nhập lại.'
-    response = api._send_request('browse', {'browseId': 'VLLM'})
-    shelves = []
-    for path in (TWO_COLUMN_RENDERER + ['secondaryContents'], SINGLE_COLUMN_TAB):
-        sections = nav(response, path + ['sectionListRenderer', 'contents'], True) or []
-        shelves.extend(section['musicPlaylistShelfRenderer'] for section in sections
-                       if 'musicPlaylistShelfRenderer' in section)
-    if len(shelves) != 1 or shelves[0].get('continuations'):
-        raise ImportRequestError(invalid)
-    rows = shelves[0].get('contents')
-    tracks = []
-    seen = set()
-    while isinstance(rows, list):
-        more = bool(rows and isinstance(rows[-1], dict) and 'continuationItemRenderer' in rows[-1])
-        entries = rows[:-1] if more else rows
-        if any(not isinstance(row, dict) or 'musicResponsiveListItemRenderer' not in row for row in entries):
-            break
-        page = parse_playlist_items(entries)
-        if len(page) != len(entries):
-            break
-        tracks.extend(page)
-        if not more or (limit is not None and len(tracks) >= limit):
-            return tracks
-        token = get_continuation_token(rows)
-        if not token or token in seen:
-            break
-        seen.add(token)
-        response = api._send_request('browse', {'continuation': token})
-        rows = nav(response, CONTINUATION_ITEMS, True)
-    raise ImportRequestError(invalid)
-
-
 def liked_tracks(api, limit=None):
+    # Parse the shelf directly. The upstream playlist parser may return just the
+    # first page as a successful result for responses with legacy pagination.
     try:
-        result = api.get_liked_songs(limit=limit)
-    except (KeyError, IndexError):
-        return _read('read liked songs', _liked_shelf, api, limit)
-    if not isinstance(result, dict) or not isinstance(result.get('tracks'), list):
-        raise ImportRequestError('YouTube Music read liked songs: missing or invalid tracks list')
-    return result['tracks']
+        return _read('đọc bài đã thích', read_liked_tracks, api, limit)
+    except LikedPlaylistError as exc:
+        raise ImportRequestError(str(exc)) from None
+
+
+def _account_info(api):
+    response = api._send_request('account/account_menu', {})
+    if isinstance(response, dict):
+        signed_in(response)
+        for action in response.get('actions', []):
+            menu = action.get('openPopupAction', {}).get('popup', {}).get('multiPageMenuRenderer', {})
+            if menu.get('header', {}).get('activeAccountHeaderRenderer'):
+                return {'authenticated': True}
+    raise ImportRequestError('YouTube Music chưa xác nhận tài khoản (ACCOUNT_MENU). Kiểm tra tài khoản đang chọn và cập nhật phiên nếu đã hết hạn.')
+
+
+def check_connection():
+    api = _read('khởi tạo kết nối', client)
+    return _read('xác minh tài khoản', _account_info, api)
 
 
 def _fetch_sync():

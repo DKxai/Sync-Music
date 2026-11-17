@@ -140,10 +140,12 @@ dialog::backdrop{background:#080a0ed0}
 <a id="spotifyLink" href="#" target="_blank" rel="noopener noreferrer" hidden>Mở Spotify để cấp quyền</a>
 <p id="spotifyMessage" role="status"></p>
 </article><article class="provider" id="ytmusicCard"><h3>YouTube Music</h3><p class="provider-status" id="ytmusicStatus"></p>
+<button id="ytmusicCheck">Kiểm tra kết nối</button>
 <button id="ytmusicAuthorize" disabled>Kết nối YouTube Music</button>
 <a id="ytmusicLink" target="_blank" rel="noopener noreferrer" hidden>Mở Google để nhập mã</a>
+<p id="ytmusicCheckResult" role="status"></p>
 <p id="ytmusicMessage" role="status"></p>
-<p id="ytmusicHelp" class="muted">Đặt tệp ytmusicapi tại <code>private/ytmusic_browser.json</code> trên máy chủ.</p>
+<p id="ytmusicHelp" class="muted">Để kết nối bằng phiên trình duyệt, tạo tệp bằng <code>ytmusicapi browser</code> rồi đặt tại <code>private/ytmusic_browser.json</code> trên máy chủ.</p>
 </article><article class="provider" id="appleCard"><h3>Apple Music</h3><p class="provider-status" id="appleStatus"></p><p class="muted" id="appleCapabilities"></p>
 <button id="appleAuthorize" disabled>Kết nối Apple Music</button>
 <a id="appleLink" target="_blank" rel="noopener noreferrer" hidden>Mở MusicKit để cấp quyền</a>
@@ -218,6 +220,7 @@ async function update(){
   renderImports(jobs);
   $('baseline').disabled=config.baseline_approved || !accounts.every(account=>account.last_success_at && account.status==='connected');
   $('spotifyAuthorize').disabled=!config.spotify_oauth_configured;
+  $('ytmusicAuthorize').hidden=!config.ytmusic_oauth_configured;
   $('ytmusicAuthorize').disabled=!config.ytmusic_oauth_configured || Boolean(googleGrant);
   $('appleAuthorize').disabled=!config.apple_oauth_configured;
   $('ytmusicHelp').hidden=config.ytmusic_oauth_configured;
@@ -272,6 +275,7 @@ function showSession(ready,message=''){
   if (!ready) {
     clearTimeout(googleTimer);
     googleGrant=undefined;
+    $('ytmusicCheckResult').textContent='';
     for (const provider of ['spotify','ytmusic','apple']) {
       $(provider+'Link').hidden=true;
       $(provider+'Message').textContent='';
@@ -644,6 +648,15 @@ $('appleAuthorize').addEventListener('click',async()=>{
   } catch(e) { $('appleMessage').textContent=e.message; }
 });
 $('appleLink').addEventListener('click',()=>{$('appleLink').hidden=true});
+$('ytmusicCheck').addEventListener('click',async()=>{
+  $('ytmusicCheck').disabled=true;
+  $('ytmusicCheckResult').textContent='Đang xác minh tài khoản…';
+  try {
+    await request('/v1/auth/ytmusic/check','POST');
+    $('ytmusicCheckResult').textContent='YouTube Music đã xác nhận tài khoản. Bạn có thể nhập lại thư viện.';
+  } catch(e) { $('ytmusicCheckResult').textContent=e.message; }
+  finally { $('ytmusicCheck').disabled=false; }
+});
 $('ytmusicAuthorize').addEventListener('click',async()=>{
   $('ytmusicAuthorize').disabled=true;
   try {

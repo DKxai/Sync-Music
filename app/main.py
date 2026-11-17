@@ -436,6 +436,19 @@ class AppleGrant(BaseModel):
     user_token: str = Field(min_length=16, max_length=8192)
 
 
+@app.post('/v1/auth/ytmusic/check', dependencies=[Depends(admin)])
+async def ytmusic_check():
+    try:
+        return await asyncio.to_thread(ytmusic.check_connection)
+    except NotConfigured as exc:
+        raise HTTPException(409, detail=str(exc)) from None
+    except ytmusic.RateLimited as exc:
+        raise HTTPException(429, detail='YouTube Music đang giới hạn yêu cầu. Hãy chờ tới lượt thử lại.',
+                            headers={'Retry-After': str(max(1, int(exc.retry_at - time.time()) + 1))}) from None
+    except ProviderResponseError as exc:
+        raise HTTPException(502, detail=str(exc)) from None
+
+
 @app.post('/v1/auth/ytmusic/start', dependencies=[Depends(admin)])
 async def ytmusic_start():
     try:
