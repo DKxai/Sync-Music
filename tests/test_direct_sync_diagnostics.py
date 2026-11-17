@@ -156,3 +156,55 @@ def test_old_spotify_pending_likes_are_cleared_only_if_absent(database):
     journal.confirm(journal.record('likes', ['unliked-after-sync']))
     undo.resolve_absent_spotify_likes('account', {'present'})
     assert {row['job_id'] for row in undo.history()} == {'old-uncertain', 'old-confirmed'}
+
+
+def test_result_groups_keep_same_name_playlists_and_directions_separate(database, monkeypatch):
+    monkeypatch.setattr(direct, '_local_match', lambda *_: ('matched-id', 'reviewed', None))
+    playlist_a = Item('owned_playlist', 'first', 'Road trip', kind='playlist')
+    playlist_b = Item('owned_playlist', 'second', 'Road trip', kind='playlist')
+    source = {'liked': [Item('liked', 'favorite', 'Favorite')],
+              'owned_playlist': [playlist_a, playlist_b],
+              'playlist:first': [Item('playlist:first', 'a', 'First song'),
+                                 Item('playlist:first', 'b', 'Second song')],
+              'playlist:second': [Item('playlist:second', 'c', 'Third song')]}
+    asyncio.run(direct._plan('job', 'ytmusic', 'spotify', source, None, dict(unmatched=0, search_deferred=0)))
+    direct_results.mark('job', 'ytmusic', [('matched-id', 2)], 'failed', 'Spotify HTTP 403')
+    direct_results.record('job', 'spotify', 'ytmusic', 'Road trip',
+                          [(0, 'Reverse song', None, 'pending', None)], collection_key='playlist:first')
+
+    groups = direct_results.list_groups(None, 0, 20)['groups']
+    assert [(group['source'], group['key']) for group in groups] == [
+        ('spotify', 'playlist:first'), ('ytmusic', 'liked'),
+        ('ytmusic', 'playlist:first'), ('ytmusic', 'playlist:second'),
+    ]
+    failed = direct_results.list_groups('failed', 0, 20)
+    assert failed['total'] == 1
+    assert failed['groups'][0]['visible'] == 1 and failed['groups'][0]['total'] == 2
+    tracks = direct_results.list_items('failed', 0, 25, source='ytmusic', collection_key='playlist:first')
+    assert [(track['title'], track['reason']) for track in tracks['items']] == [
+        ('Second song', 'Spotify HTTP 403'),
+    ]
+
+
+def test_result_groups_preserve_existing_database_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, 'DB_PATH', tmp_path / 'music.db')
+    monkeypatch.setattr(db, 'settings', replace(db.settings, data_dir=tmp_path))
+    with db.connect() as con:
+        con.execute(
+            """CREATE TABLE direct_sync_items (
+               job_id TEXT NOT NULL, source TEXT NOT NULL, target TEXT NOT NULL,
+               position INTEGER NOT NULL, title TEXT NOT NULL, artist TEXT,
+               collection TEXT, status TEXT NOT NULL, reason TEXT,
+               PRIMARY KEY(job_id,source,position))"""
+        )
+        con.execute(
+            """INSERT INTO direct_sync_items
+               VALUES ('job','spotify','ytmusic',0,'Existing song',NULL,'Old playlist','synced',NULL)"""
+        )
+    db.init_db()
+    db.init_db()
+
+    group = direct_results.list_groups(None, 0, 20)['groups'][0]
+    assert group['key'] == 'name:Old playlist'
+    items = direct_results.list_items(None, 0, 25, source='spotify', collection_key=group['key'])
+    assert items['items'][0]['title'] == 'Existing song'

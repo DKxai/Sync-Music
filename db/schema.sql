@@ -216,6 +216,7 @@ CREATE TABLE IF NOT EXISTS direct_sync_items (
   title TEXT NOT NULL,
   artist TEXT,
   collection TEXT,
+  collection_key TEXT,
   status TEXT NOT NULL,
   reason TEXT,
   PRIMARY KEY(job_id, source, position)

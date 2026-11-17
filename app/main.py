@@ -164,13 +164,27 @@ def direct_status():
     return direct.status()
 
 
+DirectItemStatus = Literal['pending', 'deferred', 'unmatched', 'failed', 'synced']
+
+
+@app.get('/v1/direct-sync/groups', dependencies=[Depends(admin)])
+def direct_groups(
+    status: DirectItemStatus | None = None,
+    offset: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+):
+    return direct_results.list_groups(status, offset, limit)
+
+
 @app.get('/v1/direct-sync/items', dependencies=[Depends(admin)])
 def direct_items(
-    status: Literal['pending', 'deferred', 'unmatched', 'failed', 'synced'] | None = None,
+    status: DirectItemStatus | None = None,
+    source: Literal['spotify', 'ytmusic'] | None = None,
+    collection_key: str | None = Query(None, max_length=512),
     offset: int = Query(0, ge=0),
     limit: int = Query(25, ge=1, le=100),
 ):
-    return direct_results.list_items(status, offset, limit)
+    return direct_results.list_items(status, offset, limit, source=source, collection_key=collection_key)
 
 
 @app.put('/v1/direct-sync/rule', dependencies=[Depends(admin)])
