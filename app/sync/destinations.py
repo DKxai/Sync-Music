@@ -1,5 +1,6 @@
 """Destination operations for additive Spotify and YouTube Music transfers."""
 import asyncio
+from itertools import count
 
 import httpx
 
@@ -21,15 +22,20 @@ class PlaylistConflict(ValueError):
     pass
 
 
+class WriteVerificationError(ValueError):
+    pass
+
+
 class SpotifyDestination:
     def __init__(self, http):
         self.http = http
         self._profile = None
 
     async def request(self, method, path, **kwargs):
-        result = await self.http.request(method, f'{spotify.API}{path}', **kwargs)
+        result = await spotify.request(self.http, method, f'{spotify.API}{path}', **kwargs)
         retry_after = result.headers.get('Retry-After', '')
-        if result.status_code == 429 and method == 'GET' and retry_after in ('1', '2', '3', '4', '5'):
+        if (spotify.rate_limit_waiter.get() is None and result.status_code == 429
+                and method == 'GET' and retry_after in ('1', '2', '3', '4', '5')):
             await asyncio.sleep(int(retry_after))
             result = await self.http.request(method, f'{spotify.API}{path}', **kwargs)
         result.raise_for_status()
@@ -64,21 +70,34 @@ class SpotifyDestination:
         response = await self.request('GET', '/me/library/contains', params={'uris': uris})
         return response.json()
 
+    async def recover_likes(self, journal):
+        for entry, ids, guard in journal.pending('likes'):
+            if guard.get('accepted') and await self._saved(ids) == [True] * len(ids):
+                journal.confirm(entry)
+
     async def apply_likes(self, ids, journal):
         for batch in batches(ids, 40):
-            saved = await self._saved(batch)
-            if not isinstance(saved, list) or len(saved) != len(batch) or any(type(value) is not bool for value in saved):
-                raise ValueError('Spotify did not confirm the existing likes.')
-            batch = [value for value, present in zip(batch, saved) if not present]
-            if not batch:
-                continue
-            entry = journal.record('likes', batch)
-            uris = ','.join(f'spotify:track:{value}' for value in batch)
-            with journal.attempt(entry):
-                await self.request('PUT', '/me/library', params={'uris': uris})
-            if await self._saved(batch) != [True] * len(batch):
-                raise ValueError('Spotify could not verify saved tracks.')
-            journal.confirm(entry)
+            while True:
+                saved = await self._saved(batch)
+                if not isinstance(saved, list) or len(saved) != len(batch) or any(type(value) is not bool for value in saved):
+                    raise WriteVerificationError('Spotify chưa xác minh được các bài đã thích.')
+                missing = [value for value, present in zip(batch, saved) if not present]
+                if not missing:
+                    break
+                entry = journal.record('likes', missing)
+                uris = ','.join(f'spotify:track:{value}' for value in missing)
+                try:
+                    with journal.attempt(entry):
+                        await self.request('PUT', '/me/library', params={'uris': uris})
+                except httpx.HTTPStatusError as exc:
+                    if await spotify.wait_after_rate_limit(exc.response):
+                        continue
+                    raise
+                journal.checkpoint(entry, {'accepted': True})
+                if await self._saved(missing) != [True] * len(missing):
+                    raise WriteVerificationError('Spotify chưa xác minh được lượt thích sau khi ghi.')
+                journal.confirm(entry)
+                break
 
     async def undo_likes(self, ids):
         for batch in batches(ids, 40):
@@ -140,7 +159,7 @@ class SpotifyDestination:
     async def playlist_tracks(self, playlist_id):
         tracks = []
         url = f'/playlists/{playlist_id}/items'
-        for offset in range(0, 10050, 50):
+        for offset in count(step=50):
             response = await self.request('GET', url, params={'offset': offset, 'limit': 50,
                                                              'fields': 'items(item(id),track(id)),next'})
             data = response.json()
@@ -151,7 +170,8 @@ class SpotifyDestination:
                 tracks.append(track.get('id'))
             if not data.get('next'):
                 return tracks
-        raise ValueError('Spotify playlist exceeds the verification limit.')
+            if len(data['items']) != 50:
+                raise PlaylistConflict('Spotify trả về một trang playlist không đầy đủ.')
 
     async def append(self, playlist_id, ids):
         response = None
@@ -178,6 +198,10 @@ class YouTubeDestination:
         info = await asyncio.to_thread(self.api.get_account_info)
         return info.get('channelHandle')
 
+    async def owns_playlist(self, playlist_id):
+        playlists = await asyncio.to_thread(self.api.get_library_playlists, limit=None)
+        return any(item.get('playlistId') == playlist_id and item.get('owned') for item in playlists)
+
     async def apply_likes(self, ids, journal):
         from ytmusicapi import LikeStatus
 
@@ -194,7 +218,7 @@ class YouTubeDestination:
             if video_id in observed:
                 journal.confirm(entry)
         if any(video_id not in observed for _, video_id in entries):
-            raise ValueError('YouTube Music could not verify saved tracks.')
+            raise WriteVerificationError('YouTube Music chưa xác minh được lượt thích sau khi ghi.')
         return journal.stats['liked_added']
 
     async def undo_likes(self, ids):

@@ -1,4 +1,6 @@
+import asyncio
 import base64
+from contextvars import ContextVar
 import os
 from datetime import datetime, timezone, timedelta
 import hashlib
@@ -17,10 +19,52 @@ API = 'https://api.spotify.com/v1'
 AUTH = 'https://accounts.spotify.com'
 SCOPES = 'user-library-read user-follow-read playlist-read-private playlist-read-collaborative'
 DIRECT_WRITE_SCOPES = frozenset({'user-library-modify', 'playlist-modify-private'})
+rate_limit_waiter = ContextVar('spotify_rate_limit_waiter', default=None)
 
 
 class MissingWriteScope(ValueError):
     pass
+
+
+async def wait_after_rate_limit(response):
+    waiter = rate_limit_waiter.get()
+    if (waiter is None or response.status_code != 429
+            or response.request.url.host not in ('api.spotify.com', 'accounts.spotify.com')):
+        return False
+    try:
+        delay = max(1, int(response.headers.get('Retry-After', '30')))
+    except ValueError:
+        delay = 30
+    await waiter(delay)
+    return True
+
+
+async def request(client, method, url, *, retry_rate_limit=False, **kwargs):
+    refreshed = False
+    retry_read = method == 'GET' and rate_limit_waiter.get() is not None
+    while True:
+        try:
+            response = await client.request(method, url, **kwargs)
+        except httpx.TransportError:
+            if not retry_read:
+                raise
+            retry_read = False
+            await asyncio.sleep(1)
+            continue
+        if (method == 'GET' or retry_rate_limit) and await wait_after_rate_limit(response):
+            continue
+        if retry_read and response.status_code in (500, 502, 503, 504):
+            retry_read = False
+            await asyncio.sleep(1)
+            continue
+        if (response.status_code == 401 and not refreshed and rate_limit_waiter.get() is not None
+                and response.request.url.host == 'api.spotify.com'):
+            refreshed = True
+            authorization = f'Bearer {await access_token()}'
+            if client.headers.get('Authorization') != authorization:
+                client.headers['Authorization'] = authorization
+                continue
+        return response
 
 
 def _require_scopes(tokens, required):
@@ -115,7 +159,8 @@ async def access_token(*, required_scopes=frozenset()):
     if not tokens.get('refresh_token'):
         raise NotConfigured('Spotify refresh_token missing: reconnect Spotify')
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f'{AUTH}/api/token', data={'grant_type':'refresh_token','refresh_token':tokens['refresh_token'],'client_id':settings.spotify_client_id})
+        r = await request(client, 'POST', f'{AUTH}/api/token', retry_rate_limit=True,
+                          data={'grant_type':'refresh_token','refresh_token':tokens['refresh_token'],'client_id':settings.spotify_client_id})
         r.raise_for_status()
         data = r.json()
     data['expires_at'] = (datetime.now(timezone.utc) + timedelta(seconds=int(data['expires_in'])-60)).timestamp()
@@ -132,7 +177,7 @@ async def fetch():
         async def paged(url, params=None, root='items'):
             results=[]
             while url:
-                r=await client.get(url, params=params)
+                r=await request(client, 'GET', url, params=params)
                 r.raise_for_status()  # incomplete pagination aborts the entire provider poll
                 data=r.json()
                 results.extend(data.get(root,[]))
@@ -145,14 +190,14 @@ async def fetch():
         while True:
             params={'type':'artist','limit':50}
             if after: params['after']=after
-            r=await client.get(f'{API}/me/following',params=params)
+            r=await request(client, 'GET', f'{API}/me/following', params=params)
             r.raise_for_status()
             d=r.json().get('artists',{})
             follow.extend(d.get('items',[]))
             after=(d.get('cursors') or {}).get('after')
             if not d.get('next') or not after: break
         playlists = await paged(f'{API}/me/playlists', {'limit':50})
-        me_resp = await client.get(f'{API}/me')
+        me_resp = await request(client, 'GET', f'{API}/me')
         me_resp.raise_for_status()
         my_id = me_resp.json().get('id')
         out={'liked':[], 'followed_artist':[], 'owned_playlist':[]}

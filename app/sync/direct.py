@@ -1,4 +1,4 @@
-"""One durable direct transfer job with bounded catalog lookups."""
+"""One direct transfer job with durable progress and batched writes."""
 import asyncio
 import json
 import os
@@ -6,15 +6,19 @@ import re
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
+from dataclasses import asdict
+from math import ceil
 from uuid import uuid4
 
 import httpx
+from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout as RequestsTimeout
+from ytmusicapi.exceptions import YTMusicServerError
 
 from ..connectors import spotify, ytmusic
 from ..connectors.base import Item
 from ..db import connect
 from . import direct_results, undo
-from .destinations import PlaylistConflict, SpotifyDestination, YouTubeDestination, batches
+from .destinations import PlaylistConflict, SpotifyDestination, WriteVerificationError, YouTubeDestination, batches
 from .engine import FETCHERS, POLL_LOCK, persist
 from .matcher import catalog_match
 from .transfer import ExportTrack, _match
@@ -23,10 +27,6 @@ ENABLED = os.getenv('AUTO_TRANSFER_ENABLED', '').lower() == 'true'
 SERVICES = ('spotify', 'ytmusic')
 BOTH = 'both'
 REMOTE_ID = re.compile(r'[A-Za-z0-9_-]{1,160}')
-MAX_SEARCHES = 120
-MAX_YOUTUBE_SEARCHES = 40
-SPOTIFY_MUTATIONS = 400
-MAX_MUTATIONS = 200
 NO_MATCH_REASONS = {
     'ambiguous': 'Có nhiều bản ghi phù hợp, cần duyệt bản ghép.',
     'insufficient': 'Có kết quả, nhưng tên bài, nghệ sĩ, thời lượng hoặc mã bản ghi chưa đủ khớp.',
@@ -71,11 +71,53 @@ def progress(job_id, state, stage, done=0, total=0, result=None):
 
 
 def recover():
+    global _task
     with connect() as con:
-        con.execute(
-            """UPDATE direct_sync_job SET state='interrupted', stage='interrupted', updated_at=datetime('now')
-               WHERE state IN ('queued','running')"""
-        )
+        job = con.execute(
+            "SELECT * FROM direct_sync_job WHERE id=1 AND state IN ('queued','running')",
+        ).fetchone()
+        if not job:
+            con.execute('DELETE FROM direct_sync_snapshots')
+            return
+        resume = ENABLED and job['stage'] != 'undo' and directions(job['source'], job['target'])
+        if not resume:
+            con.execute("UPDATE direct_sync_job SET state='interrupted', retry_at=NULL WHERE id=1")
+            con.execute('DELETE FROM direct_sync_snapshots')
+            return
+    _task = asyncio.create_task(
+        run(job['job_id'], job['source'], job['target'], resumed=True, retry_at=job['retry_at']),
+    )
+
+
+async def _wait_until(job_id, retry_at):
+    await asyncio.sleep(max(0, retry_at - time.time()))
+    with connect() as con:
+        con.execute('UPDATE direct_sync_job SET retry_at=NULL WHERE job_id=?', (job_id,))
+
+
+async def _wait_for_spotify(job_id, delay):
+    retry_at = ceil(time.time() + delay)
+    with connect() as con:
+        con.execute('UPDATE direct_sync_job SET retry_at=? WHERE job_id=?', (retry_at, job_id))
+    await _wait_until(job_id, retry_at)
+
+
+async def _snapshot(provider):
+    with connect() as con:
+        saved = con.execute('SELECT payload_json FROM direct_sync_snapshots WHERE provider=?', (provider,)).fetchone()
+    if saved:
+        return {scope: [Item(**item) for item in items] for scope, items in json.loads(saved[0]).items()}
+    snapshot = await FETCHERS[provider]()
+    if 'liked' not in snapshot or 'owned_playlist' not in snapshot:
+        raise ValueError('The snapshot lacks favorites or playlists.')
+    persist(provider, snapshot)
+    relevant = {scope: items for scope, items in snapshot.items()
+                if scope in ('liked', 'owned_playlist') or scope.startswith('playlist:')}
+    payload = json.dumps({scope: [asdict(item) for item in items] for scope, items in relevant.items()},
+                         ensure_ascii=False, separators=(',', ':'))
+    with connect() as con:
+        con.execute('INSERT INTO direct_sync_snapshots VALUES (?,?)', (provider, payload))
+    return snapshot
 
 
 def directions(source, target):
@@ -98,6 +140,7 @@ def submit(source, target):
             return {'job_id': existing['job_id'], 'already_running': True}
         con.execute('DELETE FROM direct_sync_job WHERE id=1')
         con.execute('DELETE FROM direct_sync_items')
+        con.execute('DELETE FROM direct_sync_snapshots')
         con.execute(
             """INSERT INTO direct_sync_job(id,job_id,source,target,state,stage)
                VALUES (1,?,?,?,'queued','waiting')""", (job_id, source, target),
@@ -167,11 +210,12 @@ async def _playlist_id(adapter, source, target, playlist, destination):
             (source, playlist.remote_id, target),
         ).fetchone()
     if previous and previous['target_id']:
-        return previous['target_id'] if any(
-            item.remote_id == previous['target_id'] and _owned_playlist(item, target)
-            and REMOTE_ID.fullmatch(item.remote_id)
-            for item in destination
-        ) else None
+        target_id = previous['target_id']
+        if not REMOTE_ID.fullmatch(target_id):
+            return None
+        if target == 'spotify' or any(item.remote_id == target_id for item in destination):
+            return target_id  # Spotify checks live ownership and privacy before writing.
+        return target_id if await adapter.owns_playlist(target_id) else None
     named = [item for item in destination if item.title.strip() == playlist.title.strip()]
     if named:
         if (len(named) != 1 or not _owned_playlist(named[0], target)
@@ -181,18 +225,21 @@ async def _playlist_id(adapter, source, target, playlist, destination):
     if previous:
         # A timed-out creation may still exist. Never blindly create a second playlist.
         return None
-    _bind(source, target, playlist, None)
-    try:
-        playlist_id = await adapter.create_playlist(playlist.title.strip())
-    except httpx.HTTPStatusError as exc:
-        if undo.rejected_write(exc):
-            with connect() as con:
-                con.execute(
-                    """DELETE FROM direct_playlist_links
-                       WHERE source=? AND source_id=? AND target=? AND target_id IS NULL""",
-                    (source, playlist.remote_id, target),
-                )
-        raise
+    while True:
+        _bind(source, target, playlist, None)
+        try:
+            playlist_id = await adapter.create_playlist(playlist.title.strip())
+            break
+        except httpx.HTTPStatusError as exc:
+            if undo.rejected_write(exc):
+                with connect() as con:
+                    con.execute(
+                        """DELETE FROM direct_playlist_links
+                           WHERE source=? AND source_id=? AND target=? AND target_id IS NULL""",
+                        (source, playlist.remote_id, target),
+                    )
+            if not await spotify.wait_after_rate_limit(exc.response):
+                raise
     if not isinstance(playlist_id, str) or not REMOTE_ID.fullmatch(playlist_id) or not _bind(source, target, playlist, playlist_id):
         raise ValueError('The destination did not confirm a unique playlist.')
     return playlist_id
@@ -208,9 +255,7 @@ async def _plan(job_id, source, target, source_data, adapter, result):
     total = sum(len(items) for _, items in collections)
     progress(job_id, 'running', 'match_tracks', 0, total, result)
     matches, plans = {}, []
-    done = searches = 0
-    limit = MAX_SEARCHES if target == 'spotify' else MAX_YOUTUBE_SEARCHES
-    rate_limited = False
+    done = 0
     with connect() as con:
         con.execute('DELETE FROM direct_catalog_cache WHERE expires_at<=?', (int(time.time()),))
     for playlist, items in collections:
@@ -232,23 +277,15 @@ async def _plan(job_id, source, target, source_data, adapter, result):
                 elif not match:
                     if not (track.title.strip() or track.isrc):
                         reason = 'missing_title'
-                    elif rate_limited or searches >= limit:
-                        state, reason = 'deferred', 'Chờ tra cứu danh mục ở lượt sau.'
                     else:
-                        searches += 1
                         try:
                             match, reason = await _catalog_match(adapter, source, target, track)
                         except Exception as exc:
-                            if (target == 'spotify' and isinstance(exc, httpx.HTTPStatusError)
-                                    and exc.response.status_code == 429):
-                                rate_limited = True
-                                state = 'deferred'
-                            else:
-                                rows.append((done, item.title, item.artist, 'failed', _error(exc)))
+                            state, reason = 'failed', _error(exc)
+                            if not _is_item_error(exc):
+                                rows.append((done, item.title, item.artist, state, reason))
                                 direct_results.record(job_id, source, target, collection, rows, collection_key=collection_key)
                                 raise
-                    if state == 'deferred' and rate_limited:
-                        reason = 'Spotify giới hạn yêu cầu (HTTP 429). Bài này sẽ được tra cứu ở lượt sau.'
                 if match and REMOTE_ID.fullmatch(match):
                     state, reason = 'pending', 'Đã ghép, đang chờ ghi vào dịch vụ đích.'
                 else:
@@ -257,8 +294,8 @@ async def _plan(job_id, source, target, source_data, adapter, result):
                         reason = NO_MATCH_REASONS.get(reason, NO_MATCH_REASONS['insufficient'])
                 matches[source_id] = match, state, reason
             match, state, reason = matches[source_id]
-            if state == 'deferred':
-                result['search_deferred'] += 1
+            if state == 'failed':
+                result['tracks_failed'] += 1
             elif match:
                 tracks.append((match, done))
             else:
@@ -272,8 +309,6 @@ async def _plan(job_id, source, target, source_data, adapter, result):
         if rows:
             direct_results.record(job_id, source, target, collection, rows, collection_key=collection_key)
         plans.append((playlist, tracks))
-    if rate_limited:
-        result['spotify_rate_limited'] = True
     progress(job_id, 'running', 'match_tracks', done, total, result)
     return plans
 
@@ -295,59 +330,65 @@ def _work(tracks, present, *, unique=False):
     return existing, missing
 
 
-async def _apply(job_id, source, target, source_data, target_data, adapter, result, transfer_id=None):
+async def _apply(job_id, source, target, source_data, target_data, adapter, result, transfer_id=None, *, resumed=False):
     plans = await _plan(job_id, source, target, source_data, adapter, result)
-    if target == 'spotify' and result.get('spotify_rate_limited'):
-        for _, tracks in plans:
-            _defer_writes(job_id, source, tracks, result, 'Spotify giới hạn yêu cầu (HTTP 429). Chờ ghi ở lượt sau.')
-        return
     account = await adapter.account()
     if not account:
         raise ValueError('Cannot identify the destination account for safe undo.')
     journal = undo.Journal(transfer_id or job_id, source, target, account, result)
+    if resumed:
+        journal.restore_counts()
+        if target == 'spotify':
+            await adapter.recover_likes(journal)
     target_likes = {item.remote_id for item in target_data['liked']}
-    if target == 'spotify':
+    if target == 'spotify' and not resumed:
         undo.resolve_absent_spotify_likes(account, target_likes)
     destination = list(target_data['owned_playlist'])
-    remaining = SPOTIFY_MUTATIONS if target == 'spotify' else MAX_MUTATIONS
-    for index, (playlist, tracks) in enumerate(plans):
-        progress(job_id, 'running', 'write_collections', index, len(plans), result)
+    done, total = 0, sum(len(tracks) for _, tracks in plans)
+
+    def report(count=0):
+        nonlocal done
+        done += count
+        progress(job_id, 'running', 'write_collections', done, total, result)
+
+    report()
+    for playlist, tracks in plans:
         if not tracks:
             continue
         if playlist is None:
-            remaining -= await _write_likes(job_id, source, adapter, journal, tracks, target_likes,
-                                            remaining, result)
+            await _write_likes(job_id, source, adapter, journal, tracks, target_likes, result, report)
         else:
-            remaining -= await _write_playlist(job_id, source, target, adapter, journal, playlist,
-                                               tracks, destination, remaining, result)
-    progress(job_id, 'running', 'write_collections', len(plans), len(plans), result)
+            await _write_playlist(job_id, source, target, adapter, journal, playlist,
+                                  tracks, destination, result, report)
 
 
-async def _write_likes(job_id, source, adapter, journal, tracks, existing, remaining, result):
+async def _write_likes(job_id, source, adapter, journal, tracks, existing, result, report):
     covered, missing = _work(tracks, existing, unique=True)
-    target_ids = {track_id for track_id, _ in missing}
-    duplicates = [track for track in covered if track[0] in target_ids]
-    direct_results.mark(job_id, source, [track for track in covered if track[0] not in target_ids], 'synced')
-    selected = missing[:remaining]
-    deferred = missing[remaining:]
-    deferred_ids = {track_id for track_id, _ in deferred}
-    _defer_writes(job_id, source, deferred + [track for track in duplicates if track[0] in deferred_ids], result)
-    for batch in batches(list(reversed(selected)), 40):
+    duplicates = {track_id: [] for track_id, _ in missing}
+    present = []
+    for track in covered:
+        if track[0] in duplicates:
+            duplicates[track[0]].append(track)
+        else:
+            present.append(track)
+    direct_results.mark(job_id, source, present, 'synced')
+    report(len(present))
+    for batch in batches(missing[::-1], 40):
         ids = [value for value, _ in batch]
-        followers = [track for track in duplicates if track[0] in ids]
+        affected = batch + [track for value in ids for track in duplicates[value]]
         try:
             await adapter.apply_likes(ids, journal)
         except Exception as exc:
-            direct_results.mark(job_id, source, batch + followers, 'failed', _error(exc))
-            raise
-        direct_results.mark(job_id, source, batch + followers, 'synced')
-    return len(selected)
+            direct_results.mark(job_id, source, affected, 'failed', _error(exc))
+            if not _is_item_error(exc):
+                raise
+            result['tracks_failed'] += len(affected)
+        else:
+            direct_results.mark(job_id, source, affected, 'synced')
+        report(len(affected))
 
 
-async def _write_playlist(job_id, source, target, adapter, journal, playlist, tracks, destination, remaining, result):
-    if not remaining:
-        _defer_writes(job_id, source, tracks, result)
-        return 0
+async def _write_playlist(job_id, source, target, adapter, journal, playlist, tracks, destination, result, report):
     try:
         playlist_id = (await _playlist_id(adapter, source, target, playlist, destination)
                        if 0 < len(playlist.title.strip()) <= 100 else None)
@@ -357,46 +398,72 @@ async def _write_playlist(job_id, source, target, adapter, journal, playlist, tr
             destination.append(Item('owned_playlist', playlist_id, playlist.title, kind='playlist',
                                     raw={'owned_by_me': True, 'public': False}))
         if target == 'spotify':
-            old, _ = await adapter.playlist_value(playlist_id)
+            old, snapshot = await adapter.playlist_value(playlist_id)
+            for entry, _, guard in journal.pending('playlist', playlist_id):
+                if guard.get('snapshot') == snapshot and guard.get('after') == undo.fingerprint(old):
+                    journal.confirm(entry, guard)
         else:
             old = await adapter.playlist_tracks(playlist_id)
         if not _bind(source, target, playlist, playlist_id):
             raise PlaylistConflict('Playlist đích đã liên kết với một playlist nguồn khác.')
     except Exception as exc:
         _playlist_failure(job_id, source, target, tracks, result, exc)
-        return 0
+        report(len(tracks))
+        return
     covered, missing = _work(tracks, old)
     direct_results.mark(job_id, source, covered, 'synced')
-    limit = min(100, remaining)
-    selected = missing[:limit]
-    _defer_writes(job_id, source, missing[limit:], result)
-    if selected:
-        ids = [value for value, _ in selected]
+    report(len(covered))
+
+    async def before_retry():
+        if target == 'spotify' and await adapter.playlist_value(playlist_id) != (old, snapshot):
+            raise PlaylistConflict('Playlist Spotify thay đổi trong lúc chờ giới hạn yêu cầu.')
+
+    for index, batch in enumerate(batches(missing, 100)):
+        ids = [value for value, _ in batch]
         try:
-            entry = journal.record('playlist', ids, playlist_id)
-            with journal.attempt(entry):
-                receipt = await adapter.append(playlist_id, ids)
+            entry, receipt = await journal.write_playlist(playlist_id, ids, adapter.append, before_retry)
+            if target == 'spotify' and receipt:
+                guard = {'before': undo.fingerprint(old), 'after': undo.fingerprint(old + ids),
+                         'snapshot': receipt, 'unique': not set(ids).intersection(old)}
+                journal.checkpoint(entry, guard)
             guard = await _playlist_guard(adapter, target, playlist_id, old, ids, receipt)
             journal.confirm(entry, guard)
         except Exception as exc:
-            _playlist_failure(job_id, source, target, selected, result, exc)
-            return len(selected)
-        direct_results.mark(job_id, source, selected, 'synced')
-    return len(selected)
+            remaining = missing[index * 100:]
+            _playlist_failure(job_id, source, target, remaining, result, exc)
+            report(len(remaining))
+            return
+        old += ids
+        snapshot = receipt
+        direct_results.mark(job_id, source, batch, 'synced')
+        report(len(batch))
 
 
 def _playlist_failure(job_id, source, target, tracks, result, exc):
     direct_results.mark(job_id, source, tracks, 'failed', _error(exc))
-    if not (isinstance(exc, PlaylistConflict) or (
+    if not (isinstance(exc, PlaylistConflict) or _is_item_error(exc) or (
         target == 'spotify' and isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (403, 404)
     )):
         raise exc
     result['playlists_need_review'] += 1
+    result['tracks_failed'] += len(tracks)
 
 
-def _defer_writes(job_id, source, tracks, result, reason='Chờ lượt sau do giới hạn số mục ghi mỗi lượt.'):
-    result['writes_deferred'] += len(tracks)
-    direct_results.mark(job_id, source, tracks, 'deferred', reason)
+def _is_item_error(exc):
+    if isinstance(exc, (httpx.TransportError, RequestsConnectionError, RequestsTimeout, WriteVerificationError)):
+        return True
+    status = _provider_status(exc)
+    return status in (400, 404) or (status is not None and status >= 500)
+
+
+def _provider_status(exc):
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    if isinstance(exc, YTMusicServerError):
+        match = re.match(r'Server returned HTTP ([1-5][0-9]{2})\b', str(exc))
+        if match:
+            return int(match[1])
+    return None
 
 
 async def _playlist_guard(adapter, target, playlist_id, old, added, receipt):
@@ -489,39 +556,45 @@ def _error(exc):
         if status_code == 403:
             return operation + '. Cấp lại quyền Spotify. Nếu vẫn lỗi, kiểm tra quyền ứng dụng trong Spotify Developer Dashboard.'
         return operation
-    if type(exc) is ValueError or isinstance(exc, PlaylistConflict):
+    if type(exc) is ValueError or isinstance(exc, (PlaylistConflict, WriteVerificationError)):
         return str(exc)
+    if isinstance(exc, YTMusicServerError):
+        status = _provider_status(exc)
+        return f'YouTube Music HTTP {status}.' if status else 'YouTube Music từ chối yêu cầu.'
+    if isinstance(exc, (httpx.TimeoutException, RequestsTimeout)):
+        return 'Yêu cầu tới dịch vụ âm nhạc vượt thời gian chờ.'
+    if isinstance(exc, (httpx.TransportError, RequestsConnectionError)):
+        return 'Kết nối tới dịch vụ âm nhạc bị gián đoạn.'
     return f'Direct sync stopped ({type(exc).__name__}).'
 
 
-async def run(job_id, source, target):
-    result = dict(unmatched=0, search_deferred=0, writes_deferred=0,
+async def run(job_id, source, target, *, resumed=False, retry_at=None):
+    result = dict(unmatched=0, tracks_failed=0,
                   liked_added=0, playlist_tracks_added=0, playlists_need_review=0)
     pairs = directions(source, target)
+    token = spotify.rate_limit_waiter.set(lambda delay: _wait_for_spotify(job_id, delay))
     try:
         async with POLL_LOCK:
+            if retry_at:
+                await _wait_until(job_id, retry_at)
+            if resumed:
+                with connect() as con:
+                    con.execute('DELETE FROM direct_sync_items WHERE job_id=?', (job_id,))
             progress(job_id, 'running', 'check_permissions')
             if any(destination == 'spotify' for _, destination in pairs):
                 await spotify.access_token(required_scopes=spotify.DIRECT_WRITE_SCOPES)
             snapshots = {}
             for index, provider in enumerate(dict.fromkeys(value for pair in pairs for value in pair)):
                 progress(job_id, 'running', 'read_source' if index == 0 else 'read_destination')
-                snapshot = await FETCHERS[provider]()
-                if 'liked' not in snapshot or 'owned_playlist' not in snapshot:
-                    raise ValueError('The snapshot lacks favorites or playlists.')
-                persist(provider, snapshot)
-                snapshots[provider] = snapshot
+                snapshots[provider] = await _snapshot(provider)
             for origin, destination in pairs:
                 transfer_id = f'{job_id}-{destination}' if len(pairs) > 1 else job_id
                 result['active_source'], result['active_target'] = origin, destination
                 async with destination_client(destination) as adapter:
                     await _apply(job_id, origin, destination, snapshots[origin],
-                                 snapshots[destination], adapter, result, transfer_id)
-        incomplete = any(result[key] for key in ('unmatched', 'search_deferred', 'writes_deferred', 'playlists_need_review'))
+                                 snapshots[destination], adapter, result, transfer_id, resumed=resumed)
+        incomplete = any(result[key] for key in ('unmatched', 'tracks_failed', 'playlists_need_review'))
         progress(job_id, 'partial' if incomplete else 'completed', 'finished', 1, 1, result)
-    except asyncio.CancelledError:
-        progress(job_id, 'interrupted', 'interrupted', result=result)
-        raise
     except Exception as exc:
         with connect() as con:
             current = con.execute('SELECT stage,done,total FROM direct_sync_job WHERE id=1').fetchone()
@@ -537,3 +610,11 @@ async def run(job_id, source, target):
                 result['schedule_paused'] = bool(paused.rowcount)
         result['error'] = _error(exc)
         progress(job_id, 'failed', current['stage'], current['done'], current['total'], result)
+    finally:
+        spotify.rate_limit_waiter.reset(token)
+        with connect() as con:
+            con.execute(
+                """DELETE FROM direct_sync_snapshots WHERE EXISTS (
+                   SELECT 1 FROM direct_sync_job WHERE job_id=? AND state IN ('completed','partial','failed'))""",
+                (job_id,),
+            )

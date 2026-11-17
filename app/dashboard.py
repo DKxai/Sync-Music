@@ -264,7 +264,7 @@ function renderDirect(data,config) {
     : rule?.scheduled ? 'Lịch đang bật · '+syncLabel(rule.source,rule.target) : '';
   $('directJob').hidden=!job;
   if(job){
-    const phase=busy ? stages[job.stage] : states[job.state];
+    const phase=busy && job.retry_at ? 'Đang chờ Spotify' : busy ? stages[job.stage] : states[job.state];
     const direction=job.source==='both'&&busy&&job.result.active_source
       ? syncLabel(job.result.active_source,job.result.active_target) : syncLabel(job.source,job.target);
     const text=(phase||states[job.state])+' · '+direction
@@ -277,11 +277,12 @@ function renderDirect(data,config) {
       ? [count(r.likes_removed,'lượt thích đã gỡ'),count(r.playlist_tracks_removed,'mục playlist đã gỡ'),
          count(r.conflicts,'mục playlist cần kiểm tra'),count(r.uncertain,'mục chưa xác minh')]
       : [count(r.liked_added,'lượt thích đã thêm'),count(r.playlist_tracks_added,'mục playlist đã thêm'),
-         count(r.unmatched,'mục chưa ghép'),count(r.search_deferred,'mục chờ tra cứu'),
-         count(r.writes_deferred,'mục chờ ghi lượt sau'),
-         count(r.playlists_need_review,'playlist cần kiểm tra')];
+         ...(!busy ? [count(r.unmatched,'mục chưa ghép'),count(r.tracks_failed,'mục gặp lỗi'),
+           count(r.search_deferred,'mục chờ tra cứu'),count(r.writes_deferred,'mục chờ ghi lượt sau'),
+           count(r.playlists_need_review,'playlist cần kiểm tra')] : [])];
+    const retry=busy && job.retry_at ? 'Tự tiếp tục từ '+new Date(job.retry_at*1000).toLocaleTimeString('vi-VN') : '';
     $('directResult').textContent=[r.error,...pieces,
-      r.spotify_rate_limited?'Spotify đang giới hạn yêu cầu. Sync-Music sẽ tiếp tục ở lượt sau.':'',
+      retry || (r.spotify_rate_limited?'Spotify đang giới hạn yêu cầu. Sync-Music sẽ tiếp tục ở lượt sau.':''),
       r.schedule_paused?'Đã tạm dừng lịch.':''].filter(Boolean).join(' · ');
     if(!busy && $('directMessage').textContent==='Đã xếp hàng.') $('directMessage').textContent='';
   }
