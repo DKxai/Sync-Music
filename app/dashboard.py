@@ -29,7 +29,13 @@ a{color:var(--accent)}summary{cursor:pointer;font-weight:650}details[open] summa
 pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monospace}code{overflow-wrap:anywhere}
 #undoHistory{list-style:none;margin:0;padding:0}#undoHistory li{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;border-top:1px solid var(--border);padding:10px 0}
 #undoHistory li:last-child{padding-bottom:0}
-#directItems{list-style:none;margin:0;padding:0}#directItems li{padding:10px 0;border-top:1px solid var(--border);overflow-wrap:anywhere}#directItems strong,#directItems small{display:block}
+#directGroups{display:grid;gap:10px}
+.result-group{border:1px solid var(--border);border-radius:12px;background:var(--surface);padding:12px 14px}
+.result-group summary{overflow-wrap:anywhere}.result-group summary>small{display:block;padding-left:14px}
+.result-group ul{list-style:none;margin:0;padding:0}
+.result-group li{padding:10px 0;border-top:1px solid var(--border);overflow-wrap:anywhere}
+.result-group li strong,.result-group li small{display:block}
+.result-group .flex{margin-bottom:0}
 [hidden]{display:none!important}
 @media(max-width:760px){.providers-grid{grid-template-columns:1fr}.provider-status{min-height:initial}}
 </style></head>
@@ -71,7 +77,7 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monos
   <ul id="undoHistory"></ul>
 </section>
 <details id="directItemsPanel" class="panel">
-  <summary>Chi tiết các bài trong lượt đồng bộ gần nhất</summary>
+  <summary>Kết quả theo playlist · lượt đồng bộ gần nhất</summary>
   <div class="flex">
     <label for="itemStatus">Trạng thái</label>
     <select id="itemStatus">
@@ -85,10 +91,10 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.6 ui-monospace,monos
     <button id="reloadItems" type="button">Làm mới</button>
   </div>
   <p id="itemSummary" class="muted" role="status"></p>
-  <ul id="directItems"></ul>
-  <div class="flex">
-    <button id="previousItems" type="button" disabled>Trang trước</button>
-    <button id="nextItems" type="button" disabled>Trang sau</button>
+  <div id="directGroups"></div>
+  <div id="groupPagination" class="flex" hidden>
+    <button id="previousGroups" type="button" disabled>Nhóm trước</button>
+    <button id="nextGroups" type="button" disabled>Nhóm sau</button>
   </div>
 </details>
 <section id="providers"><h2>Dịch vụ âm nhạc</h2>
@@ -302,47 +308,137 @@ function renderDirect(data,config) {
   }
 }
 const itemLabels={failed:'Gặp lỗi',pending:'Chờ ghi',deferred:'Chờ lượt sau',unmatched:'Chưa ghép',synced:'Đã có ở đích'};
-const pageSize=25;
-let itemOffset=0, itemRequest=0, itemVersion='', itemJob='';
-async function loadItems(){
-  if(!connected || !$('directItemsPanel').open)return;
-  const version=++itemRequest, offset=itemOffset, filter=$('itemStatus').value;
-  const query=new URLSearchParams({offset,limit:pageSize});
-  if(filter)query.set('status',filter);
+const trackPageSize=25, groupPageSize=20, resultGroups=new Map();
+let groupOffset=0, groupRequest=0, itemVersion='', itemJob='';
+const resultPanel=$('directItemsPanel');
+const visibleResults=()=>connected && resultPanel.open;
+
+function resultQuery(offset,limit){
+  const query=new URLSearchParams({offset,limit});
+  const status=$('itemStatus').value;
+  if(status)query.set('status',status);
+  return query;
+}
+function pageButton(label){
+  const button=document.createElement('button');
+  button.type='button';
+  button.textContent=label;
+  button.disabled=true;
+  return button;
+}
+
+function makeGroup(jobId,meta){
+  const panel=document.createElement('details'), summary=document.createElement('summary');
+  const title=document.createElement('span'), info=document.createElement('small');
+  const items=document.createElement('ul'), message=document.createElement('small'), links=document.createElement('div');
+  const previous=pageButton('Bài trước'), next=pageButton('Bài sau');
+  panel.className='result-group';
+  panel.setAttribute('name','direct-track-results');
+  links.className='flex';
+  links.hidden=true;
+  message.setAttribute('role','status');
+  summary.append(title,info);
+  links.append(previous,next);
+  panel.append(summary,items,message,links);
+  const group={jobId,panel,title,info,items,message,links,previous,next,meta,offset:0,request:0};
+  previous.onclick=()=>{group.offset=Math.max(0,group.offset-trackPageSize);void loadTracks(group);};
+  next.onclick=()=>{group.offset+=trackPageSize;void loadTracks(group);};
+  panel.addEventListener('toggle',()=>{if(panel.open)void loadTracks(group);});
+  return group;
+}
+
+function updateGroup(group,meta){
+  group.meta=meta;
+  group.title.textContent=meta.collection===null ? 'Bài đã thích' : meta.collection||'Playlist chưa có tên';
+  const count=meta.visible===meta.total ? meta.total : meta.visible+'/'+meta.total;
+  group.info.textContent=syncLabel(meta.source,meta.target)+' · '+count+' mục';
+}
+
+async function loadTracks(group){
+  if(!visibleResults() || !group.panel.open || !group.panel.isConnected)return;
+  const version=++group.request, offset=group.offset, {source,key}=group.meta;
+  const query=resultQuery(offset,trackPageSize);
+  query.set('source',source);
+  query.set('collection_key',key);
+  const current=()=>version===group.request && visibleResults() && group.panel.open && group.panel.isConnected;
   try{
-    const {items,total}=await request('/v1/direct-sync/items?'+query);
-    if(version!==itemRequest || !connected)return;
+    const {items,total,job_id}=await request('/v1/direct-sync/items?'+query);
+    if(!current() || job_id!==group.jobId)return;
     if(offset && offset>=total){
-      itemOffset=total?Math.floor((total-1)/pageSize)*pageSize:0;
-      return loadItems();
+      group.offset=total?Math.floor((total-1)/trackPageSize)*trackPageSize:0;
+      return loadTracks(group);
     }
     const rows=items.map(item=>{
       const row=document.createElement('li'), title=document.createElement('strong'), details=document.createElement('small');
       title.textContent=[item.title||'Bài chưa có tên',item.artist].filter(Boolean).join(' · ');
-      details.textContent=[itemLabels[item.status],syncLabel(item.source,item.target),
-        item.collection||'Bài đã thích',item.reason].filter(Boolean).join(' · ');
+      details.textContent=[itemLabels[item.status],item.reason].filter(Boolean).join(' · ');
       row.append(title,details);
       return row;
     });
-    $('directItems').replaceChildren(...rows);
-    $('itemSummary').textContent=total?(offset+1)+'–'+(offset+items.length)+' / '+total+' mục':'Chưa có mục ở trạng thái này.';
-    $('previousItems').disabled=offset===0;
-    $('nextItems').disabled=offset+pageSize>=total;
+    group.items.replaceChildren(...rows);
+    group.message.textContent=total?(offset+1)+'–'+(offset+items.length)+' / '+total+' mục':'Chưa có bài ở trạng thái này.';
+    group.links.hidden=total<=trackPageSize;
+    group.previous.disabled=offset===0;
+    group.next.disabled=offset+trackPageSize>=total;
   }catch(error){
-    if(version===itemRequest)$('itemSummary').textContent=error.message;
+    if(current())group.message.textContent=error.message;
   }
 }
+
+function clearGroups(){
+  groupRequest++;
+  resultGroups.clear();
+  $('directGroups').replaceChildren();
+  $('groupPagination').hidden=true;
+}
+
+async function loadGroups(){
+  if(!visibleResults())return;
+  const version=++groupRequest, offset=groupOffset;
+  try{
+    const {groups,total,job_id}=await request('/v1/direct-sync/groups?'+resultQuery(offset,groupPageSize));
+    if(version!==groupRequest || !visibleResults())return;
+    if(offset && offset>=total){
+      groupOffset=total?Math.floor((total-1)/groupPageSize)*groupPageSize:0;
+      return loadGroups();
+    }
+    const keys=new Set();
+    for(const [index,meta] of groups.entries()){
+      const key=JSON.stringify([job_id,meta.source,meta.key]);
+      keys.add(key);
+      let group=resultGroups.get(key);
+      if(!group){
+        group=makeGroup(job_id,meta);
+        resultGroups.set(key,group);
+      }
+      updateGroup(group,meta);
+      const container=$('directGroups'), current=container.children[index];
+      if(current!==group.panel)container.insertBefore(group.panel,current||null);
+      if(group.panel.open)void loadTracks(group);
+    }
+    for(const [key,group] of resultGroups){
+      if(!keys.has(key)){group.panel.remove();resultGroups.delete(key);}
+    }
+    $('itemSummary').textContent=total?(offset+1)+'–'+(offset+groups.length)+' / '+total+' nhóm':'Chưa có nhóm chứa bài ở trạng thái này.';
+    $('groupPagination').hidden=total<=groupPageSize;
+    $('previousGroups').disabled=offset===0;
+    $('nextGroups').disabled=offset+groupPageSize>=total;
+  }catch(error){
+    if(version===groupRequest && visibleResults())$('itemSummary').textContent=error.message;
+  }
+}
+
 function updateItemView(job){
   const id=job?.stage.startsWith('undo')?itemJob:job?.job_id||'';
-  if(id!==itemJob){itemJob=id;itemOffset=0;}
+  if(id!==itemJob){itemJob=id;groupOffset=0;clearGroups();}
   const version=JSON.stringify([itemJob,job?.stage,job?.updated_at,job?.done,job?.state]);
-  if(version!==itemVersion){itemVersion=version;void loadItems();}
+  if(version!==itemVersion){itemVersion=version;void loadGroups();}
 }
-$('directItemsPanel').addEventListener('toggle',loadItems);
-$('itemStatus').onchange=()=>{itemOffset=0;void loadItems();};
-$('reloadItems').onclick=loadItems;
-$('previousItems').onclick=()=>{itemOffset=Math.max(0,itemOffset-pageSize);void loadItems();};
-$('nextItems').onclick=()=>{itemOffset+=pageSize;void loadItems();};
+resultPanel.addEventListener('toggle',loadGroups);
+$('itemStatus').onchange=()=>{groupOffset=0;clearGroups();void loadGroups();};
+$('reloadItems').onclick=loadGroups;
+$('previousGroups').onclick=()=>{groupOffset=Math.max(0,groupOffset-groupPageSize);void loadGroups();};
+$('nextGroups').onclick=()=>{groupOffset+=groupPageSize;void loadGroups();};
 function renderImports(jobs){
   const items=[];
   for(const [provider,job] of Object.entries(jobs)){

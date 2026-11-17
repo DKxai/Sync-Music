@@ -30,6 +30,10 @@ def init_db():
     with connect() as con:
         con.executescript(SCHEMA.read_text(encoding='utf-8'))
         con.execute('PRAGMA synchronous=NORMAL')
+        con.execute('BEGIN IMMEDIATE')
+        columns = {row['name'] for row in con.execute('PRAGMA table_info(direct_sync_items)')}
+        if 'collection_key' not in columns:
+            con.execute('ALTER TABLE direct_sync_items ADD COLUMN collection_key TEXT')
 
 def get_setting(name: str):
     with connect() as con:

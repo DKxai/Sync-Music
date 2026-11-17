@@ -211,6 +211,8 @@ async def _plan(job_id, source, target, source_data, adapter, result):
         con.execute('DELETE FROM direct_catalog_cache WHERE expires_at<=?', (int(time.time()),))
     for playlist, items in collections:
         tracks, rows = [], []
+        collection = playlist.title if playlist else None
+        collection_key = f'playlist:{playlist.remote_id}' if playlist else 'liked'
         for item in items:
             source_id = item.raw.get('track_id') or item.remote_id
             if source_id not in matches:
@@ -229,7 +231,7 @@ async def _plan(job_id, source, target, source_data, adapter, result):
                             match = await _catalog_match(adapter, source, target, track)
                         except Exception as exc:
                             rows.append((done, item.title, item.artist, 'failed', _error(exc)))
-                            direct_results.record(job_id, source, target, playlist.title if playlist else None, rows)
+                            direct_results.record(job_id, source, target, collection, rows, collection_key=collection_key)
                             raise
                     else:
                         state, reason = 'deferred', 'Chờ tra cứu danh mục ở lượt sau.'
@@ -248,11 +250,11 @@ async def _plan(job_id, source, target, source_data, adapter, result):
             rows.append((done, item.title, item.artist, state, reason))
             done += 1
             if len(rows) >= 10:
-                direct_results.record(job_id, source, target, playlist.title if playlist else None, rows)
+                direct_results.record(job_id, source, target, collection, rows, collection_key=collection_key)
                 rows.clear()
                 progress(job_id, 'running', 'match_tracks', done, total, result)
         if rows:
-            direct_results.record(job_id, source, target, playlist.title if playlist else None, rows)
+            direct_results.record(job_id, source, target, collection, rows, collection_key=collection_key)
         plans.append((playlist, tracks))
     progress(job_id, 'running', 'match_tracks', done, total, result)
     return plans
