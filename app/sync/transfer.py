@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from ..connectors import spotify, ytmusic
 from ..db import connect
-from .matcher import preview_score
+from .matcher import catalog_match, search_title
 
 MAX_TRACKS = 1000
 PLAYLIST_TRANSFER_ENABLED = os.getenv('PLAYLIST_TRANSFER_ENABLED', '').lower() == 'true'
@@ -91,31 +91,17 @@ def _match(con, source, target, track):
     ).fetchone()
     if approved:
         return approved[0], 'reviewed'
-    if track.isrc:
-        codes = con.execute(
-            """SELECT m.remote_id FROM provider_mappings m JOIN music_items c
-               ON m.music_item_id=c.id WHERE m.provider=? AND m.entity_kind='track'
-               AND c.isrc=? LIMIT 2""", (target, track.isrc),
-        ).fetchall()
-        if codes:
-            return (codes[0][0], 'isrc') if len(codes) == 1 else (None, 'ambiguous')
     candidates = con.execute(
         """SELECT m.remote_id,c.title,c.artist,c.duration_ms,c.isrc
            FROM music_items c JOIN provider_mappings m ON m.music_item_id=c.id
-           WHERE m.provider=? AND m.entity_kind='track' AND c.title=? COLLATE NOCASE
-           LIMIT 51""", (target, track.title),
+           WHERE m.provider=? AND m.entity_kind='track'
+             AND (c.title=? COLLATE NOCASE OR c.search_title=? OR c.isrc=?)
+           LIMIT 101""", (target, track.title, search_title(track.title), track.isrc),
     ).fetchall()
-    if len(candidates) == 51:
+    if len(candidates) == 101:
         return None, 'ambiguous'
-    exact = [
-        row['remote_id'] for row in candidates
-        if not (track.isrc and row['isrc'] and track.isrc != row['isrc'])
-        and preview_score(track.title, track.artist, track.duration_ms,
-                          row['title'], row['artist'], row['duration_ms']) == 1.0
-    ]
-    if len(exact) == 1:
-        return exact[0], 'title_artist_duration'
-    return None, 'ambiguous' if exact else 'unmatched'
+    match, reason = catalog_match(track, candidates)
+    return (match, 'library_match') if match else (None, 'ambiguous' if reason == 'ambiguous' else 'unmatched')
 
 
 def preview(library, target):

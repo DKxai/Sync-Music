@@ -25,6 +25,7 @@ class Settings:
     apple_team_id: str = os.getenv('APPLE_TEAM_ID', '')
     apple_key_id: str = os.getenv('APPLE_KEY_ID', '')
     apple_web_origin: str = os.getenv('APPLE_WEB_ORIGIN', '').rstrip('/')
+    apple_favorites_playlist_id: str = os.getenv('APPLE_FAVORITES_PLAYLIST_ID','').strip()
     apple_storefront: str = os.getenv('APPLE_STOREFRONT', 'vn')
 
 settings = Settings()

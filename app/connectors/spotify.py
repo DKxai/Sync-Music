@@ -1,6 +1,7 @@
 import asyncio
 import base64
 from contextvars import ContextVar
+from dataclasses import asdict
 import os
 from datetime import datetime, timezone, timedelta
 import hashlib
@@ -8,13 +9,14 @@ import json
 from math import ceil
 import secrets
 import time
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 
 from cryptography.fernet import Fernet
 import httpx
+from . import requests_log
 from .base import Item, NotConfigured, ProviderResponseError
 from ..config import settings
-from ..db import connect, get_setting
+from ..db import connect, get_setting, set_setting
 from ..provider_tokens import invalidate_account
 
 API = 'https://api.spotify.com/v1'
@@ -23,6 +25,32 @@ SCOPES = 'user-library-read user-follow-read playlist-read-private playlist-read
 DIRECT_WRITE_SCOPES = frozenset({'user-library-modify', 'playlist-modify-private'})
 rate_limit_waiter = ContextVar('spotify_rate_limit_waiter', default=None)
 COOLDOWN_SETTING = 'spotify_api_retry_at'
+_pacing = False
+_spacing = 0.2
+_next_request = 0.0
+
+
+def enable_pacing(enabled):
+    global _pacing, _spacing, _next_request
+    _pacing = enabled
+    _spacing, _next_request = 0.2, 0.0
+
+
+async def pace():
+    global _next_request
+    now = time.monotonic()
+    earliest = max(now, _next_request)
+    _next_request = earliest + _spacing
+    if earliest > now:
+        await asyncio.sleep(earliest - now)
+
+
+def adjust_pace(status):
+    global _spacing
+    if status == 429:
+        _spacing = min(2.0, _spacing * 2)
+    elif status < 400:
+        _spacing = max(0.2, _spacing * 0.995)
 
 
 class MissingWriteScope(ValueError):
@@ -40,12 +68,20 @@ def record_rate_limit(response):
     host = response.request.url.host
     if host not in ('api.spotify.com', 'accounts.spotify.com'):
         return None
+    reason = 'rate_limit'
     try:
-        delay = max(1, int(response.headers.get('Retry-After', '30')))
+        if response.json().get('error', {}).get('reason') == 'QUOTA_EXCEEDED':
+            reason = 'quota'
+    except (ValueError, AttributeError):
+        pass
+    fallback = 3600 if reason == 'quota' else 30
+    try:
+        delay = max(1, int(response.headers.get('Retry-After', fallback)))
     except ValueError:
-        delay = 30
+        delay = fallback
     deadline = ceil(time.time() + delay)
     if host == 'api.spotify.com':
+        set_setting('spotify_limit_reason', reason)
         with connect() as con:
             row = con.execute(
                 """INSERT INTO settings(key,value) VALUES (?,?) ON CONFLICT(key) DO UPDATE
@@ -67,15 +103,25 @@ async def wait_after_rate_limit(response):
 async def request(client, method, url, *, retry_rate_limit=False, **kwargs):
     refreshed = False
     retry_read = method == 'GET' and rate_limit_waiter.get() is not None
+    path = urlsplit(str(url)).path
+    operation = ('authorize' if path == '/api/token' else 'search' if path == '/v1/search'
+                 else 'verify' if path.endswith('/contains') else 'read' if method == 'GET' else 'write')
     while True:
+        paced = _pacing and urlsplit(str(url)).netloc == 'api.spotify.com'
+        if paced:
+            await pace()
         try:
             response = await client.request(method, url, **kwargs)
         except httpx.TransportError:
+            requests_log.record('spotify', operation, 0)
             if not retry_read:
                 raise
             retry_read = False
             await asyncio.sleep(1)
             continue
+        requests_log.record('spotify', operation, response.status_code)
+        if paced:
+            adjust_pace(response.status_code)
         if (method == 'GET' or retry_rate_limit) and await wait_after_rate_limit(response):
             continue
         if retry_read and response.status_code in (500, 502, 503, 504):
@@ -188,7 +234,7 @@ async def redeem(code: str, state: str):
             raise ValueError('Invalid or expired OAuth state')
     verifier = _cipher().decrypt(row['verifier_ciphertext']).decode()
     async with httpx.AsyncClient(timeout=30) as client:
-        r = await client.post(f'{AUTH}/api/token', data={'grant_type':'authorization_code','code':code,'redirect_uri':settings.spotify_redirect_uri,'client_id':settings.spotify_client_id,'code_verifier':verifier})
+        r = await request(client, 'POST', f'{AUTH}/api/token', data={'grant_type':'authorization_code','code':code,'redirect_uri':settings.spotify_redirect_uri,'client_id':settings.spotify_client_id,'code_verifier':verifier})
         data = _token_response(r)
     if not data.get('refresh_token'):
         raise ProviderResponseError('Spotify cấp token: phản hồi thiếu refresh token.')
@@ -218,8 +264,12 @@ async def fetch():
     headers = {'Authorization':f'Bearer {token}'}
     async with httpx.AsyncClient(timeout=35, headers=headers) as client:
         async def paged(url, operation, params=None):
-            results=[]
+            results, seen = [], set()
             while url:
+                parsed = urlsplit(url)
+                if parsed.netloc != 'api.spotify.com' or parsed.scheme != 'https' or url in seen:
+                    raise ProviderResponseError(f'Spotify {operation}: đường dẫn phân trang không hợp lệ.')
+                seen.add(url)
                 r=await request(client, 'GET', url, params=params)
                 r.raise_for_status()  # incomplete pagination aborts the entire provider poll
                 data=response_object(r, operation)
@@ -251,9 +301,11 @@ async def fetch():
         if not my_id:
             raise ProviderResponseError('Spotify đọc tài khoản: phản hồi thiếu mã tài khoản.')
         out={'liked':[], 'followed_artist':[], 'owned_playlist':[]}
-        for entry in likes:
+        for position, entry in enumerate(likes):
             track=entry.get('track') or {}
-            if not track.get('id'): continue
+            if not track.get('id'):
+                out['liked'].append(unavailable('liked', position, track))
+                continue
             out['liked'].append(Item('liked',track['id'],track.get('name') or '',artist=', '.join(x['name'] for x in track.get('artists',[]) if x.get('name')),album=(track.get('album') or {}).get('name'),duration_ms=track.get('duration_ms'),isrc=(track.get('external_ids') or {}).get('isrc'),raw={'added_at':entry.get('added_at')}))
         for a in follow:
             if a.get('id'):out['followed_artist'].append(Item('followed_artist',a['id'],a.get('name') or '',kind='artist'))
@@ -262,25 +314,76 @@ async def fetch():
             if owner != my_id and not p.get('collaborative'): continue
             if not p.get('id'): continue
             out['owned_playlist'].append(Item('owned_playlist',p['id'],p.get('name') or '',kind='playlist',raw={'snapshot_id':p.get('snapshot_id'),'collaborative':p.get('collaborative'),'owned_by_me':bool(my_id and owner == my_id),'public':p.get('public')}))
-            # Spotify Development Mode 2026: only owned/collaborative items are supported.
+            scope = f"playlist:{p['id']}"
+            version = p.get('snapshot_id')
+            cached = playlist_cache(my_id, p['id'], version)
+            if cached is not None:
+                out[scope] = cached
+                continue
             items = await paged(f"{API}/playlists/{p['id']}/items", 'đọc bài trong playlist', {'limit':50})
-            scope=f"playlist:{p['id']}"
-            out[scope]=[]
-            occurrences={}
-            for pos,entry in enumerate(items):
-                t=entry.get('item') or entry.get('track') or {}
-                if not t.get('id'): continue
-                occurrences[t["id"]]=occurrences.get(t["id"],0)+1
-                out[scope].append(Item(scope, f"{t['id']}#{occurrences[t['id']]}",t.get('name') or '',artist=', '.join(x['name'] for x in t.get('artists',[]) if x.get('name')), album=(t.get('album') or {}).get('name'),duration_ms=t.get('duration_ms'),isrc=(t.get('external_ids') or {}).get('isrc'),raw={'track_id':t['id'],'position':pos}))
+            if version:
+                check = await request(client, 'GET', f"{API}/playlists/{p['id']}", params={'fields': 'snapshot_id'})
+                check.raise_for_status()
+                if response_object(check, 'xác minh phiên bản playlist').get('snapshot_id') != version:
+                    raise ProviderResponseError('Playlist Spotify thay đổi khi đọc. Hệ thống sẽ thử lại.')
+            out[scope] = playlist_items(scope, items)
+            if version:
+                save_playlist_cache(my_id, p['id'], version, out[scope])
         return out
 
+
+
+def unavailable(scope, position, track):
+    return Item(scope, f'unavailable:{position}', track.get('name') or 'Bài không khả dụng',
+                raw={'position': position, 'unavailable': True})
+
+
+def playlist_items(scope, entries):
+    tracks, occurrences = [], {}
+    for pos, entry in enumerate(entries):
+        track = entry.get('item') or entry.get('track') or {}
+        track_id = track.get('id')
+        if not track_id or track.get('type') not in (None, 'track') or track.get('is_local'):
+            tracks.append(unavailable(scope, pos, track))
+            continue
+        occurrences[track_id] = occurrences.get(track_id, 0) + 1
+        tracks.append(Item(
+            scope, f'{track_id}#{occurrences[track_id]}', track.get('name') or '',
+            artist=', '.join(x['name'] for x in track.get('artists') or [] if x.get('name')),
+            album=(track.get('album') or {}).get('name'), duration_ms=track.get('duration_ms'),
+            isrc=(track.get('external_ids') or {}).get('isrc'),
+            raw={'track_id': track_id, 'position': pos, 'added_at': entry.get('added_at')},
+        ))
+    return tracks
+
+
+def playlist_cache(account, playlist_id, snapshot_id):
+    if not snapshot_id:
+        return None
+    with connect() as con:
+        row = con.execute(
+            """SELECT payload FROM spotify_playlist_cache
+               WHERE account=? AND playlist_id=? AND snapshot_id=? AND fetched_at>?""",
+            (account, playlist_id, snapshot_id, int(time.time()) - 86400),
+        ).fetchone()
+    return [Item(**item) for item in json.loads(row[0])] if row else None
+
+
+def save_playlist_cache(account, playlist_id, snapshot_id, items):
+    with connect() as con:
+        con.execute(
+            """INSERT INTO spotify_playlist_cache VALUES (?,?,?,?,?)
+               ON CONFLICT(account,playlist_id) DO UPDATE SET snapshot_id=excluded.snapshot_id,
+               fetched_at=excluded.fetched_at,payload=excluded.payload""",
+            (account, playlist_id, snapshot_id, int(time.time()), json.dumps([asdict(item) for item in items])),
+        )
 
 
 async def contains(scope: str, remote_id: str) -> bool:
     kind = {'liked': 'track', 'followed_artist': 'artist'}[scope]
     headers = {'Authorization': f'Bearer {await access_token()}'}
     async with httpx.AsyncClient(timeout=20, headers=headers) as client:
-        response = await client.get(f'{API}/me/library/contains',
+        response = await request(client, 'GET', f'{API}/me/library/contains',
                                     params={'uris': f'spotify:{kind}:{remote_id}'})
         response.raise_for_status()
         found = response.json()
@@ -293,6 +396,6 @@ async def add_to_library(scope: str, remote_id: str) -> None:
     kind = {'liked': 'track', 'followed_artist': 'artist'}[scope]
     headers = {'Authorization': f'Bearer {await access_token()}'}
     async with httpx.AsyncClient(timeout=20, headers=headers) as client:
-        response = await client.put(f'{API}/me/library',
+        response = await request(client, 'PUT', f'{API}/me/library',
                                     params={'uris': f'spotify:{kind}:{remote_id}'})
         response.raise_for_status()

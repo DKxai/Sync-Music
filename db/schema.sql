@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS music_items (
   album TEXT,
   duration_ms INTEGER,
   isrc TEXT,
+  search_title TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS music_isrc_idx ON music_items(isrc) WHERE isrc IS NOT NULL;
@@ -173,6 +174,7 @@ CREATE TABLE IF NOT EXISTS direct_sync_job (
   total INTEGER NOT NULL DEFAULT 0,
   result_json TEXT,
   retry_at INTEGER,
+  retry_provider TEXT,
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -197,6 +199,8 @@ CREATE TABLE IF NOT EXISTS direct_catalog_cache (
   target_id TEXT,
   expires_at INTEGER NOT NULL,
   reason TEXT,
+  match_key TEXT,
+  candidates_json TEXT,
   PRIMARY KEY(source,source_id,target)
 );
 
@@ -224,9 +228,57 @@ CREATE TABLE IF NOT EXISTS direct_sync_items (
   artist TEXT,
   collection TEXT,
   collection_key TEXT,
+  source_id TEXT,
+  target_id TEXT,
   status TEXT NOT NULL,
   reason TEXT,
-  PRIMARY KEY(job_id, source, position)
+  PRIMARY KEY(job_id, source, target, position)
 );
 CREATE INDEX IF NOT EXISTS direct_sync_items_status_idx
   ON direct_sync_items(job_id, status, source, position);
+
+CREATE TABLE IF NOT EXISTS sync_schedule (
+  name TEXT PRIMARY KEY,
+  next_at INTEGER NOT NULL,
+  idle_checks INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS library_versions (
+  provider TEXT PRIMARY KEY,
+  fingerprint TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS spotify_playlist_cache (
+  account TEXT NOT NULL,
+  playlist_id TEXT NOT NULL,
+  snapshot_id TEXT NOT NULL,
+  fetched_at INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY(account, playlist_id)
+);
+
+CREATE TABLE IF NOT EXISTS direct_sync_runs (
+  job_id TEXT PRIMARY KEY,
+  source TEXT NOT NULL,
+  target TEXT NOT NULL,
+  state TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  finished_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS direct_sync_runs_finished_idx ON direct_sync_runs(finished_at DESC);
+
+CREATE TABLE IF NOT EXISTS provider_requests (
+  day TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  status INTEGER NOT NULL,
+  requests INTEGER NOT NULL,
+  PRIMARY KEY(day, provider, operation, status)
+);
+
+CREATE TABLE IF NOT EXISTS import_jobs (
+  job_id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  state TEXT NOT NULL,
+  payload_json TEXT NOT NULL
+);

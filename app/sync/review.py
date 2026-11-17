@@ -48,10 +48,11 @@ def candidates(provider: str, kind: str, remote_id: str) -> dict:
     return {'source': dict(source), 'target_provider': target, 'candidates': ranked[:10]}
 
 
-def approve(provider: str, kind: str, source_id: str, target_id: str) -> dict:
-    if not SAFE_REMOTE_ID.fullmatch(source_id) or not SAFE_REMOTE_ID.fullmatch(target_id):
+def approve(provider: str, kind: str, source_id: str, target_id: str, *, target_provider=None) -> dict:
+    source_pattern = re.compile(r'[A-Za-z0-9._-]{1,128}') if provider == 'apple' else SAFE_REMOTE_ID
+    if not source_pattern.fullmatch(source_id) or not SAFE_REMOTE_ID.fullmatch(target_id):
         raise ValueError('Expected provider-native IDs')
-    target = ADD_PROVIDERS[provider]
+    target = target_provider or ADD_PROVIDERS[provider]
     directions = [(provider, target, kind, source_id, target_id),
                   (target, provider, kind, target_id, source_id)]
     try:
@@ -70,6 +71,8 @@ def approve(provider: str, kind: str, source_id: str, target_id: str) -> dict:
                 ).fetchone()
                 if row['target_id'] != direction[4]:
                     raise ValueError('This identifier already has a different reviewed link')
+            con.execute("DELETE FROM settings WHERE key LIKE 'direct_observation:%'")
+            con.execute("DELETE FROM sync_schedule WHERE name='direct'")
     except sqlite3.IntegrityError as exc:
         raise ValueError('Both IDs must exist in their imported catalogs and form a one-to-one link') from exc
     return {'source_provider': provider, 'target_provider': target, 'kind': kind,
