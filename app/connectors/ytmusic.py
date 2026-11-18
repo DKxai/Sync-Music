@@ -9,7 +9,7 @@ from requests import RequestException, Session
 from requests.structures import CaseInsensitiveDict
 
 from . import requests_log
-from .ytmusic_likes import LikedPlaylistError, read_liked_tracks, signed_in
+from .ytmusic_likes import LikedPlaylistError, read_liked_tracks
 from .base import Item, NotConfigured, ProviderResponseError
 from ..config import settings
 from ..provider_tokens import load_token, save_token
@@ -153,20 +153,12 @@ def liked_tracks(api, limit=None):
         raise ImportRequestError(str(exc)) from None
 
 
-def _account_info(api):
-    response = api._send_request('account/account_menu', {})
-    if isinstance(response, dict):
-        signed_in(response)
-        for action in response.get('actions', []):
-            menu = action.get('openPopupAction', {}).get('popup', {}).get('multiPageMenuRenderer', {})
-            if menu.get('header', {}).get('activeAccountHeaderRenderer'):
-                return {'authenticated': True}
-    raise ImportRequestError('YouTube Music chưa xác nhận tài khoản (ACCOUNT_MENU). Kiểm tra tài khoản đang chọn và cập nhật phiên nếu đã hết hạn.')
-
-
 def check_connection():
     api = _read('khởi tạo kết nối', client)
-    return _read('xác minh tài khoản', _account_info, api)
+    # Verify the private library used by imports. A zero limit validates the
+    # first response, including an empty library, without following a cursor.
+    liked_tracks(api, limit=0)
+    return {'authenticated': True}
 
 
 def _fetch_sync():

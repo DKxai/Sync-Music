@@ -106,10 +106,9 @@ def test_selected_tab_and_explicit_empty_library():
 def test_connection_probe_reports_only_authentication(monkeypatch):
     api = Mock()
     monkeypatch.setattr(ytmusic, 'client', lambda: api)
-    api._send_request.return_value = {'actions': [{'openPopupAction': {'popup': {'multiPageMenuRenderer': {
-        'header': {'activeAccountHeaderRenderer': {'accountName': 'private name'}}}}}}]}
+    api._send_request.return_value = legacy_first()
     assert ytmusic.check_connection() == {'authenticated': True}
-    api._send_request.assert_called_once_with('account/account_menu', {})
+    api._send_request.assert_called_once_with('browse', {'browseId': 'VLLM'})
     api._send_request.return_value = {'responseContext': {'serviceTrackingParams': [
         {'params': [{'key': 'logged_in', 'value': '0'}]}]}}
     with pytest.raises(ytmusic.ProviderResponseError, match='đăng nhập lại'):
@@ -132,3 +131,18 @@ def test_browser_file_with_missing_origin_and_authorization(tmp_path, monkeypatc
     with pytest.raises(ytmusic.NotConfigured, match='không hợp lệ') as error:
         ytmusic.client()
     assert 'private-value' not in str(error.value)
+
+
+def test_connection_probe_requires_readable_private_library(monkeypatch):
+    from ytmusicapi.exceptions import YTMusicServerError
+
+    api = Mock()
+    monkeypatch.setattr(ytmusic, 'client', lambda: api)
+    api._send_request.return_value = liked_response([])
+    assert ytmusic.check_connection() == {'authenticated': True}
+    api._send_request.return_value = {}
+    with pytest.raises(ytmusic.ImportRequestError, match='LM_SHELF'):
+        ytmusic.check_connection()
+    api._send_request.side_effect = YTMusicServerError('Server returned HTTP 400: Bad Request.')
+    with pytest.raises(ytmusic.ImportRequestError, match='HTTP 400'):
+        ytmusic.check_connection()
