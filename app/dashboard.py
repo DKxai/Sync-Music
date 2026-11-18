@@ -190,7 +190,7 @@ dialog::backdrop{background:#080a0ed0}
 </main>
 <script>
 let connected=false, refreshing=false, ruleDirty=false, ruleApplied='', undoRendered='', directBusy=false;
-let googleGrant, googleTimer;
+let googleGrant, googleTimer, checkVersion=0;
 const $=x=>document.getElementById(x);
 document.querySelector('a[href="#importPanel"]').addEventListener('click',()=>{
   $('importPanel').open=true;
@@ -220,6 +220,7 @@ async function update(){
   renderImports(jobs);
   $('baseline').disabled=config.baseline_approved || !accounts.every(account=>account.last_success_at && account.status==='connected');
   $('spotifyAuthorize').disabled=!config.spotify_oauth_configured;
+  $('ytmusicCheck').disabled=Boolean(googleGrant) || $('ytmusicCheck').dataset.busy==='true';
   $('ytmusicAuthorize').hidden=!config.ytmusic_oauth_configured;
   $('ytmusicAuthorize').disabled=!config.ytmusic_oauth_configured || Boolean(googleGrant);
   $('appleAuthorize').disabled=!config.apple_oauth_configured;
@@ -247,7 +248,7 @@ async function update(){
         : status==='Đã cấu hình, chờ nhập lần đầu' ? 'Chờ nhập thư viện' : status);
     }
     if(provider==='ytmusic' && config.ytmusic_retry_at && config.provider_ready.ytmusic)
-      status='Đã kết nối · Chờ YouTube Music tới '+retryTime(config.ytmusic_retry_at);
+      status='YouTube Music giới hạn yêu cầu · Thử lại từ '+retryTime(config.ytmusic_retry_at);
     $(provider+'Status').textContent=status;
     $(provider+'Card').dataset.state=config.provider_ready[provider] && account?.last_error?'error':'ready';
     $(provider+'Card').dataset.connected=String(provider==='spotify' ? config.provider_ready.spotify : account?.status==='connected');
@@ -275,6 +276,8 @@ function showSession(ready,message=''){
   if (!ready) {
     clearTimeout(googleTimer);
     googleGrant=undefined;
+    checkVersion++;
+    $('ytmusicCheck').dataset.busy='false';
     $('ytmusicCheckResult').textContent='';
     for (const provider of ['spotify','ytmusic','apple']) {
       $(provider+'Link').hidden=true;
@@ -649,25 +652,45 @@ $('appleAuthorize').addEventListener('click',async()=>{
 });
 $('appleLink').addEventListener('click',()=>{$('appleLink').hidden=true});
 $('ytmusicCheck').addEventListener('click',async()=>{
+  const version=++checkVersion;
+  $('ytmusicCheck').dataset.busy='true';
   $('ytmusicCheck').disabled=true;
-  $('ytmusicCheckResult').textContent='Đang xác minh tài khoản…';
+  $('ytmusicCheckResult').textContent='Đang kiểm tra quyền đọc thư viện…';
   try {
     await request('/v1/auth/ytmusic/check','POST');
-    $('ytmusicCheckResult').textContent='YouTube Music đã xác nhận tài khoản. Bạn có thể nhập lại thư viện.';
-  } catch(e) { $('ytmusicCheckResult').textContent=e.message; }
-  finally { $('ytmusicCheck').disabled=false; }
+    if(version===checkVersion)
+      $('ytmusicCheckResult').textContent='Đã đọc được trang đầu của danh sách bài đã thích.';
+  } catch(e) {
+    if(version===checkVersion) $('ytmusicCheckResult').textContent=e.message;
+  } finally {
+    if(version===checkVersion){
+      $('ytmusicCheck').dataset.busy='false';
+      $('ytmusicCheck').disabled=false;
+    }
+  }
 });
 $('ytmusicAuthorize').addEventListener('click',async()=>{
+  const starting={};
+  googleGrant=starting;
+  ++checkVersion;
+  $('ytmusicCheck').dataset.busy='false';
+  $('ytmusicCheck').disabled=true;
+  $('ytmusicCheckResult').textContent='';
   $('ytmusicAuthorize').disabled=true;
   try {
-    googleGrant=await request('/v1/auth/ytmusic/start','POST');
+    const grant=await request('/v1/auth/ytmusic/start','POST');
+    if(googleGrant!==starting) return;
+    googleGrant=grant;
     $('ytmusicLink').href=googleGrant.verification_url;
     $('ytmusicLink').hidden=false;
     $('ytmusicMessage').textContent='Nhập mã '+googleGrant.user_code+' trên trang Google.';
     googleTimer=setTimeout(checkGoogleGrant,googleGrant.interval*1000);
   } catch(e) {
+    if(googleGrant!==starting) return;
+    googleGrant=undefined;
     $('ytmusicMessage').textContent=e.message;
     $('ytmusicAuthorize').disabled=false;
+    $('ytmusicCheck').disabled=false;
   }
 });
 async function checkGoogleGrant(){
@@ -681,7 +704,7 @@ async function checkGoogleGrant(){
       return;
     }
     $('ytmusicMessage').textContent=result.status==='connected'
-      ? 'YouTube Music đã kết nối. Máy chủ đã xếp hàng nhập dữ liệu.'
+      ? 'Google đã cấp quyền. Xem kết quả đọc thư viện trong Lịch sử nhập.'
       : 'Cấp quyền chưa hoàn tất. Hãy thử lại.';
   } catch(e) {
     if (googleGrant!==grant) return;
