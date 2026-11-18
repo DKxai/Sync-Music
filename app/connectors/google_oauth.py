@@ -11,6 +11,7 @@ import httpx
 from ..config import settings
 from ..provider_tokens import save_token
 from .base import NotConfigured
+from .ytmusic_transport import retry_seconds
 
 DEVICE_URL = 'https://oauth2.googleapis.com/device/code'
 TOKEN_URL = 'https://oauth2.googleapis.com/token'
@@ -76,13 +77,22 @@ async def poll(handle: str) -> dict:
         if now < grant.next_poll:
             return {'status': 'pending', 'interval': grant.interval}
         grant.next_poll = now + grant.interval
-        async with httpx.AsyncClient(timeout=15) as client:
-            response = await client.post(TOKEN_URL, data={
-                'client_id': settings.ytm_client_id,
-                'client_secret': settings.ytm_client_secret,
-                'device_code': grant.device_code,
-                'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
-            })
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(TOKEN_URL, data={
+                    'client_id': settings.ytm_client_id,
+                    'client_secret': settings.ytm_client_secret,
+                    'device_code': grant.device_code,
+                    'grant_type': 'urn:ietf:params:oauth:grant-type:device_code',
+                })
+        except httpx.TransportError:
+            delay = min(60, grant.interval * 2)
+            grant.next_poll = time.monotonic() + delay
+            return {'status': 'pending', 'interval': delay}
+        if response.status_code == 429 or response.status_code >= 500:
+            delay = max(grant.interval, retry_seconds(response.headers.get('Retry-After'), grant.interval * 2))
+            grant.next_poll = time.monotonic() + delay
+            return {'status': 'pending', 'interval': min(delay, max(1, int(grant.expires_at - time.monotonic()) + 1))}
         data = response.json()
         error = data.get('error')
         if error in ('authorization_pending', 'slow_down'):

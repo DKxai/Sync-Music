@@ -220,8 +220,7 @@ class YouTubeDestination:
         ]
 
     async def account(self):
-        info = await ytmusic.call('đọc thông tin tài khoản', self.api.get_account_info)
-        return info.get('channelHandle')
+        return await ytmusic.call('đọc thông tin tài khoản', ytmusic.destination_account, self.api)
 
     async def owns_playlist(self, playlist_id):
         playlists = await ytmusic.call('đọc danh sách playlist', self.api.get_library_playlists, limit=None)
