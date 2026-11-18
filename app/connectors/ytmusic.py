@@ -3,53 +3,30 @@ import json
 import re
 import time
 from contextvars import ContextVar
-from math import ceil
+from threading import Lock
 
 from requests import RequestException, Session
+from cryptography.fernet import InvalidToken
 from requests.structures import CaseInsensitiveDict
 
-from . import requests_log
+from .ytmusic_transport import MusicSession, RateLimited, api_retry_at
 from .ytmusic_likes import LikedPlaylistError, read_liked_tracks
 from .base import Item, NotConfigured, ProviderResponseError
 from ..config import settings
-from ..provider_tokens import load_token, save_token
-from ..db import get_setting, set_setting
+from ..provider_tokens import load_token, replace_token
+
 
 
 rate_limit_waiter = ContextVar('ytmusic_rate_limit_waiter', default=None)
 
 
-class RateLimited(Exception):
-    def __init__(self, retry_at):
-        self.retry_at = retry_at
-        super().__init__('YouTube Music đang giới hạn yêu cầu.')
+_refresh_lock = Lock()
 
 
-def api_retry_at():
-    deadline = int(get_setting('ytmusic_api_retry_at') or 0)
-    return deadline if deadline > time.time() else None
-
-
-class MusicSession(Session):
+class GoogleSession(Session):
     def request(self, method, url, **kwargs):
-        if deadline := api_retry_at():
-            raise RateLimited(deadline)
-        kwargs.setdefault('timeout', 30)
-        endpoint = url.partition('?')[0]
-        operation = ('search' if endpoint.endswith('/search') else 'write'
-                     if any(part in endpoint for part in ('/like/', '/edit_playlist', '/playlist/', '/subscription/'))
-                     else 'read')
-        response = super().request(method, url, **kwargs)
-        requests_log.record('ytmusic', operation, response.status_code)
-        if response.status_code == 429:
-            try:
-                delay = max(1, int(response.headers.get('Retry-After', '60')))
-            except ValueError:
-                delay = 60
-            deadline = ceil(time.time() + delay)
-            set_setting('ytmusic_api_retry_at', str(deadline))
-            raise RateLimited(deadline)
-        return response
+        kwargs.setdefault('timeout', 20)
+        return super().request(method, url, **kwargs)
 
 
 def duration_ms(track):
@@ -70,18 +47,28 @@ def client():
     from ytmusicapi.helpers import get_authorization, sapisid_from_cookie
 
     if settings.ytm_client_id and settings.ytm_client_secret:
-        token = load_token('ytmusic')
-        if token and token.get('client_id') == settings.ytm_client_id:
-            credentials = OAuthCredentials(settings.ytm_client_id, settings.ytm_client_secret)
-            # Persist refreshes encrypted without creating a plaintext credentials file.
-            if token['expires_at'] <= time.time() + 90:
-                refreshed = credentials.refresh_token(token['refresh_token'])
-                if not refreshed.get('access_token'):
-                    raise NotConfigured('Google token refresh failed. Reconnect YouTube Music.')
-                token.update(refreshed)
-                token['expires_at'] = int(time.time()) + int(token['expires_in'])
-                save_token('ytmusic', token)
-            return YTMusic(token, oauth_credentials=credentials, requests_session=MusicSession())
+        with _refresh_lock:
+            try:
+                token = load_token('ytmusic')
+            except InvalidToken:
+                raise NotConfigured('Không đọc được token Google đã lưu. Kiểm tra ENCRYPTION_KEY của bản deploy.') from None
+            if token:
+                if token.get('client_id') != settings.ytm_client_id:
+                    raise NotConfigured('OAuth client đã thay đổi. Hãy cấp lại quyền Google trên dashboard.')
+                credentials = OAuthCredentials(settings.ytm_client_id, settings.ytm_client_secret, session=GoogleSession())
+                if token['expires_at'] <= time.time() + 90:
+                    refreshed = credentials.refresh_token(token['refresh_token'])
+                    if refreshed.get('error') == 'invalid_grant':
+                        raise NotConfigured('Google đã từ chối refresh token. Hãy cấp lại quyền YouTube Music.')
+                    if refreshed.get('error') in ('invalid_client', 'unauthorized_client'):
+                        raise NotConfigured('Google từ chối OAuth client. Kiểm tra YTM_CLIENT_ID và YTM_CLIENT_SECRET.')
+                    if not refreshed.get('access_token'):
+                        raise ImportRequestError('Google chưa cấp được access token mới. Kiểm tra cấu hình OAuth rồi thử lại.')
+                    renewed = {**token, **refreshed, 'expires_at': int(time.time()) + int(refreshed['expires_in'])}
+                    if not replace_token('ytmusic', token, renewed):
+                        raise ImportRequestError('Phiên Google đã thay đổi trong lúc gia hạn. Hãy thử lại.')
+                    token = renewed
+                return YTMusic(token, oauth_credentials=credentials, requests_session=MusicSession())
     if not settings.ytm_auth_path.is_file():
         raise NotConfigured('Hãy cấu hình Google OAuth hoặc đặt tệp phiên tại private/ytmusic_browser.json trên máy chủ.')
     try:
@@ -151,6 +138,42 @@ def liked_tracks(api, limit=None):
         return _read('đọc bài đã thích', read_liked_tracks, api, limit)
     except LikedPlaylistError as exc:
         raise ImportRequestError(str(exc)) from None
+
+
+def destination_account(api):
+    """Use the same channel handle that existing undo records identify."""
+    from ytmusicapi.auth.types import AuthType
+    from ytmusicapi.exceptions import YTMusicServerError
+
+    try:
+        handle = api.get_account_info().get('channelHandle')
+        if handle:
+            return handle
+    except YTMusicServerError as exc:
+        if not str(exc).startswith('Server returned HTTP 400:'):
+            raise
+    except (KeyError, IndexError):
+        pass
+
+    if api.auth_type == AuthType.OAUTH_CUSTOM_CLIENT:
+        # Only send the OAuth bearer to Google's fixed API. Browser cookies and
+        # other web-client headers must never accompany this request.
+        response = api._session.get(
+            'https://www.googleapis.com/youtube/v3/channels',
+            headers={'Authorization': api.headers['authorization']},
+            params={'mine': 'true', 'part': 'snippet', 'fields': 'items(snippet/customUrl),nextPageToken'},
+            allow_redirects=False,
+        )
+        if response.status_code != 200:
+            raise ImportRequestError(f'YouTube Data API từ chối đọc kênh (HTTP {response.status_code}). '
+                                     'Kiểm tra YouTube Data API v3 và quyền của tài khoản Google.')
+        data = response.json()
+        channels = data.get('items', [])
+        if not data.get('nextPageToken') and len(channels) == 1:
+            handle = channels[0].get('snippet', {}).get('customUrl')
+            if isinstance(handle, str) and handle.startswith('@'):
+                return handle
+    raise ImportRequestError('Chưa xác định được kênh YouTube để ghi và hoàn tác. Kiểm tra kênh đang chọn.')
 
 
 def check_connection():

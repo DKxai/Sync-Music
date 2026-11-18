@@ -25,6 +25,19 @@ def load_token(provider: str) -> dict | None:
     return json.loads(Fernet(settings.encryption_key.encode()).decrypt(row[0]))
 
 
+def replace_token(provider: str, previous: dict, renewed: dict) -> bool:
+    """Prevent an in-flight refresh overwriting a newly authorized account."""
+    cipher = Fernet(settings.encryption_key.encode())
+    with connect() as con:
+        con.execute('BEGIN IMMEDIATE')
+        row = con.execute('SELECT payload_ciphertext FROM encrypted_tokens WHERE provider=?', (provider,)).fetchone()
+        if row is None or json.loads(cipher.decrypt(row[0])) != previous:
+            return False
+        con.execute("UPDATE encrypted_tokens SET payload_ciphertext=?,updated_at=datetime('now') WHERE provider=?",
+                    (cipher.encrypt(json.dumps(renewed).encode()), provider))
+        return True
+
+
 def save_token(provider: str, payload: dict, *, reconnect: bool = False) -> None:
     ciphertext = Fernet(settings.encryption_key.encode()).encrypt(json.dumps(payload).encode())
     with connect() as con:
