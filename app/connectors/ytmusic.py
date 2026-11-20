@@ -3,6 +3,7 @@ import json
 import re
 import time
 from contextvars import ContextVar
+from hashlib import sha256
 from threading import Lock
 
 from requests import RequestException, Session
@@ -13,7 +14,8 @@ from .ytmusic_transport import MusicSession, RateLimited, api_retry_at
 from .ytmusic_likes import LikedPlaylistError, SignedOut, read_liked_tracks
 from .base import Item, NotConfigured, ProviderResponseError
 from ..config import settings
-from ..provider_tokens import load_token, replace_token
+from ..db import get_setting
+from ..provider_tokens import has_token, load_token, replace_token
 
 
 
@@ -41,10 +43,18 @@ def duration_ms(track):
         return total * 1000 or None
     return None
 
-def client(*, rejected_access_token=None):
+def auth_mode():
+    return get_setting('ytmusic_auth_mode') or 'auto'
+
+
+def client(*, rejected_access_token=None, mode=None):
+    selected = mode is None
+    mode = mode or auth_mode()
+    if mode == 'browser':
+        expected = get_setting('ytmusic_browser_fingerprint') if selected else None
+        return browser_client(expected_fingerprint=expected)
+
     from ytmusicapi import OAuthCredentials, YTMusic
-    from ytmusicapi.exceptions import YTMusicUserError
-    from ytmusicapi.helpers import get_authorization, sapisid_from_cookie
 
     if settings.ytm_client_id and settings.ytm_client_secret:
         with _refresh_lock:
@@ -71,10 +81,23 @@ def client(*, rejected_access_token=None):
                 api = YTMusic(token, oauth_credentials=credentials, requests_session=MusicSession())
                 api._sync_access_token = token['access_token']
                 return api
+    if mode == 'oauth':
+        raise NotConfigured('Chưa lưu quyền Google cho hồ sơ này.')
+    return browser_client()
+
+
+def browser_client(*, expected_fingerprint=None):
+    from ytmusicapi import YTMusic
+    from ytmusicapi.exceptions import YTMusicUserError
+    from ytmusicapi.helpers import get_authorization, sapisid_from_cookie
+
     if not settings.ytm_auth_path.is_file():
-        raise NotConfigured('Hãy cấu hình Google OAuth hoặc đặt tệp phiên tại private/ytmusic_browser.json trên máy chủ.')
+        raise NotConfigured(f'Chưa có tệp phiên trình duyệt. Tải lên {settings.ytm_auth_path.name} trong thư mục private của hồ sơ.')
     try:
-        headers = CaseInsensitiveDict(json.loads(settings.ytm_auth_path.read_text(encoding='utf-8-sig')))
+        raw = settings.ytm_auth_path.read_bytes()
+        if expected_fingerprint and sha256(raw).hexdigest() != expected_fingerprint:
+            raise NotConfigured('Tệp phiên đã thay đổi. Hãy kiểm tra và chọn Dùng phiên trình duyệt lại.')
+        headers = CaseInsensitiveDict(json.loads(raw.decode('utf-8-sig')))
         if not all(isinstance(v, str) for v in headers.values()):
             raise ValueError
         if not headers.get('cookie'):
@@ -193,8 +216,30 @@ def read_session(limit=None):
         rejected = getattr(api, '_sync_access_token', None)
         if not isinstance(rejected, str):
             raise
-        renewed = _read('gia hạn phiên Google', client, rejected_access_token=rejected)
+        renewed = _read('gia hạn phiên Google', client, rejected_access_token=rejected, mode='oauth')
         return renewed, liked_tracks(renewed, limit)
+
+
+def validate_mode(mode):
+    before = sha256(settings.ytm_auth_path.read_bytes()).hexdigest() if (
+        mode == 'browser' and settings.ytm_auth_path.is_file()) else None
+    candidate = _read('khởi tạo kết nối', client, mode=mode)
+    liked_tracks(candidate, limit=0)
+    if mode == 'browser' and has_token('ytmusic'):
+        # Connection methods share transfer history only when both identify the same channel.
+        oauth = _read('khởi tạo kết nối Google', client, mode='oauth')
+        expected = _read('xác định kênh Google', destination_account, oauth)
+        actual = _read('xác định kênh trình duyệt', destination_account, candidate)
+        if expected.casefold() != actual.casefold():
+            raise NotConfigured('Tệp phiên trình duyệt thuộc kênh khác với kết nối Google của hồ sơ này.')
+    if mode == 'browser':
+        try:
+            after = sha256(settings.ytm_auth_path.read_bytes()).hexdigest()
+        except OSError:
+            after = None
+        if not before or before != after:
+            raise NotConfigured('Tệp phiên đã thay đổi trong lúc kiểm tra. Vui lòng thử lại.')
+    return before
 
 
 def check_connection():

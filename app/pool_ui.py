@@ -55,6 +55,19 @@ document.addEventListener('DOMContentLoaded',()=>{
      if(!confirm('Gỡ '+label(s,p)+' và dừng lịch của hồ sơ? Tệp phiên YouTube của hồ sơ cũng bị xóa khi gỡ YouTube Music.'))return;
      await request(prefix(s)+'/v1/auth/'+p+'/connection','DELETE');grantVersion++;link.hidden=true;result.textContent='Đã gỡ kết nối.';await refreshPool()
    });
+   if(p==='ytmusic'){
+     const path='private/'+(s==='main'?'':s+'/')+'ytmusic_browser.json';
+     const mode=node('p','');mode.className='muted';card.append(mode);
+     card._mode=mode;
+     const selectMode=async mode=>{
+       await request(prefix(s)+'/v1/auth/ytmusic/mode','PUT',{mode});
+       result.textContent='Đã kiểm tra Liked Music và đổi cách kết nối. Lịch đồng bộ đã tạm dừng.';
+       await refreshPool();
+     };
+     action(card,'Dùng phiên trình duyệt',async()=>selectMode('browser'));
+     action(card,'Dùng quyền Google đã lưu',async()=>selectMode('oauth'));
+     card._path=path;
+   }
    if(p==='spotify'){const uri=node('small','');card.append(uri);card._uri=uri}
    card.append(link,result);cards.push({s,p,status,login,card});
    for(const id of ['poolFrom','poolTo'])$(id).add(new Option(label(s,p),s+'/'+p));
@@ -70,6 +83,12 @@ document.addEventListener('DOMContentLoaded',()=>{
        c.status.textContent=googleMissing?'Thiếu YTM_CLIENT_ID hoặc YTM_CLIENT_SECRET trong runtime.':
          (view.config.provider_ready[c.p]?(a?.last_error||'Đã cấu hình'):'Chưa kết nối');
        if(c.card._uri)c.card._uri.textContent='Redirect URI: '+view.config.spotify_redirect_uri;
+       if(c.card._mode){
+         const mode=view.config.ytmusic_auth_mode;
+         c.card._mode.textContent=(mode==='browser'?'Đang dùng phiên trình duyệt. ':
+           mode==='oauth'?'Đang dùng quyền Google. ':'Đang ưu tiên quyền Google nếu có. ')+
+           (view.config.ytmusic_browser_available?'Đã có tệp phiên.':'Chưa có tệp '+c.card._path+'.');
+       }
        c.login.disabled=googleMissing;
      }}
    const rows=await request('/v1/pool/routes');$('poolRoutes').replaceChildren();
