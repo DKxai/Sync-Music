@@ -11,6 +11,10 @@ class LikedPlaylistError(ProviderResponseError):
     pass
 
 
+class SignedOut(LikedPlaylistError):
+    pass
+
+
 def incomplete(code, page):
     return LikedPlaylistError(
         f'YouTube Music chưa trả đủ bài đã thích (trang {page}, {code}). '
@@ -23,7 +27,7 @@ def signed_in(response):
     flags = [p.get('value') for service in context.get('serviceTrackingParams', [])
              for p in service.get('params', []) if p.get('key') == 'logged_in']
     if context.get('mainAppWebResponseContext', {}).get('loggedOut') is True or '0' in flags:
-        raise LikedPlaylistError('YouTube Music yêu cầu đăng nhập lại. Hãy cập nhật tệp phiên hoặc cấp lại quyền Google.')
+        raise SignedOut('YouTube Music yêu cầu đăng nhập lại. Hãy cập nhật tệp phiên hoặc cấp lại quyền Google.')
 
 
 def first_shelf(response):

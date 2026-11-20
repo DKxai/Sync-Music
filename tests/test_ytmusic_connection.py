@@ -149,3 +149,15 @@ def test_network_timeout_retries_only_a_read(database, monkeypatch, path, count)
     with pytest.raises(requests.Timeout):
         transport.MusicSession().post('https://music.youtube.com/youtubei/v1/' + path, json={})
     assert send.call_count == count
+
+
+def test_rejected_unexpired_session_renews_once(monkeypatch):
+    old = Mock(_sync_access_token='rejected')
+    new = Mock()
+    clients = Mock(side_effect=[old, new])
+    monkeypatch.setattr(ytmusic, 'client', clients)
+    reads = Mock(side_effect=[ytmusic.SessionRejected('signed out'), ['song']])
+    monkeypatch.setattr(ytmusic, 'liked_tracks', reads)
+    assert ytmusic.read_session() == (new, ['song'])
+    clients.assert_called_with(rejected_access_token='rejected')
+    assert clients.call_count == 2
