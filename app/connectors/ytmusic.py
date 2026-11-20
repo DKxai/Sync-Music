@@ -10,7 +10,7 @@ from cryptography.fernet import InvalidToken
 from requests.structures import CaseInsensitiveDict
 
 from .ytmusic_transport import MusicSession, RateLimited, api_retry_at
-from .ytmusic_likes import LikedPlaylistError, read_liked_tracks
+from .ytmusic_likes import LikedPlaylistError, SignedOut, read_liked_tracks
 from .base import Item, NotConfigured, ProviderResponseError
 from ..config import settings
 from ..provider_tokens import load_token, replace_token
@@ -41,7 +41,7 @@ def duration_ms(track):
         return total * 1000 or None
     return None
 
-def client():
+def client(*, rejected_access_token=None):
     from ytmusicapi import OAuthCredentials, YTMusic
     from ytmusicapi.exceptions import YTMusicUserError
     from ytmusicapi.helpers import get_authorization, sapisid_from_cookie
@@ -56,7 +56,7 @@ def client():
                 if token.get('client_id') != settings.ytm_client_id:
                     raise NotConfigured('OAuth client đã thay đổi. Hãy cấp lại quyền Google trên dashboard.')
                 credentials = OAuthCredentials(settings.ytm_client_id, settings.ytm_client_secret, session=GoogleSession())
-                if token['expires_at'] <= time.time() + 90:
+                if token['expires_at'] <= time.time() + 90 or token['access_token'] == rejected_access_token:
                     refreshed = credentials.refresh_token(token['refresh_token'])
                     if refreshed.get('error') == 'invalid_grant':
                         raise NotConfigured('Google đã từ chối refresh token. Hãy cấp lại quyền YouTube Music.')
@@ -68,7 +68,9 @@ def client():
                     if not replace_token('ytmusic', token, renewed):
                         raise ImportRequestError('Phiên Google đã thay đổi trong lúc gia hạn. Hãy thử lại.')
                     token = renewed
-                return YTMusic(token, oauth_credentials=credentials, requests_session=MusicSession())
+                api = YTMusic(token, oauth_credentials=credentials, requests_session=MusicSession())
+                api._sync_access_token = token['access_token']
+                return api
     if not settings.ytm_auth_path.is_file():
         raise NotConfigured('Hãy cấu hình Google OAuth hoặc đặt tệp phiên tại private/ytmusic_browser.json trên máy chủ.')
     try:
@@ -80,9 +82,8 @@ def client():
         # Browser auth signs the origin on every request. An absent origin otherwise signs "None".
         if not headers.get('origin') and not headers.get('x-origin'):
             headers['origin'] = 'https://music.youtube.com'
-        if not headers.get('authorization'):
-            origin = headers.get('origin') or headers['x-origin']
-            headers['authorization'] = get_authorization(sapisid_from_cookie(headers['cookie']) + ' ' + origin)
+        origin = headers.get('origin') or headers['x-origin']
+        headers['authorization'] = get_authorization(sapisid_from_cookie(headers['cookie']) + ' ' + origin)
         return YTMusic(dict(headers), requests_session=MusicSession())
     except (OSError, ValueError, TypeError, AttributeError, KeyError, YTMusicUserError):
         raise NotConfigured('Tệp ytmusic_browser.json không hợp lệ. Tạo lại bằng ytmusicapi browser từ phiên YouTube Music đang đăng nhập.') from None
@@ -90,6 +91,10 @@ def client():
 
 class ImportRequestError(ProviderResponseError):
     """Safe error metadata for the dashboard and import audit."""
+
+
+class SessionRejected(ImportRequestError):
+    pass
 
 
 def _read(stage, method, *args, **kwargs):
@@ -102,7 +107,9 @@ def _read(stage, method, *args, **kwargs):
         raise ImportRequestError('Google từ chối cấu hình OAuth. Kiểm tra client ID và cấp lại quyền YouTube Music.') from None
     except YTMusicServerError as exc:
         match = re.match(r'Server returned HTTP ([1-5][0-9]{2})\b', str(exc))
-        if match and match[1] in ('401', '403'):
+        if match and match[1] == '401':
+            raise SessionRejected('YouTube Music từ chối phiên hiện tại (HTTP 401).') from None
+        if match and match[1] == '403':
             raise ImportRequestError(f'YouTube Music từ chối quyền truy cập (HTTP {match[1]}). Kiểm tra tài khoản và cấp lại quyền hoặc cập nhật tệp phiên.') from None
         detail = f'HTTP {match[1]}' if match else 'YTMusicServerError'
         raise ImportRequestError(f'YouTube Music {stage}: {detail}') from None
@@ -136,6 +143,8 @@ def liked_tracks(api, limit=None):
     # first page as a successful result for responses with legacy pagination.
     try:
         return _read('đọc bài đã thích', read_liked_tracks, api, limit)
+    except SignedOut as exc:
+        raise SessionRejected(str(exc)) from None
     except LikedPlaylistError as exc:
         raise ImportRequestError(str(exc)) from None
 
@@ -176,17 +185,27 @@ def destination_account(api):
     raise ImportRequestError('Chưa xác định được kênh YouTube để ghi và hoàn tác. Kiểm tra kênh đang chọn.')
 
 
-def check_connection():
+def read_session(limit=None):
     api = _read('khởi tạo kết nối', client)
+    try:
+        return api, liked_tracks(api, limit)
+    except SessionRejected:
+        rejected = getattr(api, '_sync_access_token', None)
+        if not isinstance(rejected, str):
+            raise
+        renewed = _read('gia hạn phiên Google', client, rejected_access_token=rejected)
+        return renewed, liked_tracks(renewed, limit)
+
+
+def check_connection():
     # Verify the private library used by imports. A zero limit validates the
     # first response, including an empty library, without following a cursor.
-    liked_tracks(api, limit=0)
+    read_session(limit=0)
     return {'authenticated': True}
 
 
 def _fetch_sync():
-    api = _read('initialize client', client)
-    likes = _read('read liked songs', liked_tracks, api)
+    api, likes = read_session()
     out={'liked':[], 'followed_artist':[], 'owned_playlist':[]}
     liked_ids = set()
     for pos, t in enumerate(likes):
