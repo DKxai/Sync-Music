@@ -24,7 +24,7 @@ from . import direct_results, schedule, undo
 from .destinations import PlaylistConflict, SpotifyDestination, WriteVerificationError, YouTubeDestination, batches
 from .engine import FETCHERS, POLL_LOCK, persist
 from .matcher import catalog_match
-from .transfer import ExportTrack, _match
+from .transfer import ExportTrack, _match, catalog_match_key
 
 ENABLED = os.getenv('AUTO_TRANSFER_ENABLED', '').lower() == 'true'
 SERVICES = ('spotify', 'ytmusic')
@@ -225,9 +225,7 @@ def _local_match(source, target, track):
 
 
 def _match_key(track, target):
-    evidence = ('v2', track.title, track.artist, track.duration_ms, track.isrc,
-                get_setting(target + '_auth_version'))
-    return sha256(json.dumps(evidence, ensure_ascii=False).encode()).hexdigest()
+    return catalog_match_key(track, get_setting(target + '_auth_version'))
 
 
 async def _catalog_match(adapter, source, target, track):

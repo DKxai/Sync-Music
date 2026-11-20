@@ -1,8 +1,44 @@
+import asyncio
 import os
 import subprocess
 import sys
+from unittest.mock import Mock
 
 from cryptography.fernet import Fernet
+
+from app import pool
+from app.pool_routes import Routes
+
+
+def test_pool_schedule_reuses_primary_schedule_only_for_the_same_accounts(monkeypatch):
+    routes = Routes({})
+    monkeypatch.setattr(pool.main, 'active_direct_schedule', lambda: {'source': 'ytmusic', 'target': 'spotify'})
+    assert routes.covered_by_primary_schedule('main/ytmusic', 'main/spotify')
+    assert not routes.covered_by_primary_schedule('main/spotify', 'main/ytmusic')
+    assert not routes.covered_by_primary_schedule('main/ytmusic', 'secondary/spotify')
+    monkeypatch.setattr(pool.main, 'active_direct_schedule', lambda: None)
+    assert not routes.covered_by_primary_schedule('main/ytmusic', 'main/spotify')
+
+
+def test_covered_route_still_loads_its_worker_but_skips_new_scheduled_runs(monkeypatch):
+    profile = Mock()
+    profile.provider_ready.return_value = True
+    source, target = 'main/ytmusic', 'main/spotify'
+    routes = Routes({'main': profile})
+    versions = {'spotify': ['1'], 'ytmusic': ['1']}
+    monkeypatch.setattr(routes, 'rules', lambda: {
+        'route': {'source': source, 'target': target, 'versions': versions, 'scheduled': True},
+    })
+    monkeypatch.setattr(routes, 'versions', lambda endpoints: versions)
+    worker = Mock()
+    worker.running.return_value = False
+    worker.schedule.next_check.return_value = 0
+    load_worker = Mock(return_value=worker)
+    monkeypatch.setattr(routes, 'worker', load_worker)
+    monkeypatch.setattr(pool.main, 'active_direct_schedule', lambda: {'source': 'both', 'target': 'both'})
+    asyncio.run(routes.tick())
+    load_worker.assert_called_once_with(source, target, versions)
+    worker.submit.assert_not_called()
 
 
 def test_profile_login_disconnect_and_isolation(tmp_path):

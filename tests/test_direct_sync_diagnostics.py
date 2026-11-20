@@ -17,6 +17,19 @@ from app.sync.matcher import catalog_match
 from app.sync.transfer import ExportTrack
 
 
+def test_spotify_reuses_identical_search_in_a_run(monkeypatch):
+    adapter = SpotifyDestination(None)
+    request = AsyncMock(return_value=httpx.Response(200, json={'tracks': {'items': []}}))
+    monkeypatch.setattr(adapter, 'request', request)
+
+    async def search_twice():
+        for track_id in ('first', 'second'):
+            await adapter.search(ExportTrack(source_id=track_id, title='A Song', artist='An Artist'))
+
+    asyncio.run(search_twice())
+    request.assert_awaited_once()
+
+
 @pytest.fixture
 def database(tmp_path, monkeypatch):
     monkeypatch.setattr(db, 'DB_PATH', tmp_path / 'music.db')

@@ -64,6 +64,8 @@ def invalidate_account(con, provider: str) -> None:
     con.execute('DELETE FROM direct_catalog_cache WHERE target=?', (provider,))
     con.execute("DELETE FROM settings WHERE key LIKE 'direct_observation:%'")
     con.execute('DELETE FROM library_versions WHERE provider=?', (provider,))
+    con.execute('DELETE FROM library_export_snapshots WHERE provider=?', (provider,))
+    con.execute('DELETE FROM library_export_order WHERE provider=?', (provider,))
     con.execute('DELETE FROM sync_schedule WHERE name IN (?,?)', (provider, 'direct'))
     con.execute("UPDATE settings SET value='false',updated_at=datetime('now') WHERE key='baseline_approved'")
     con.execute('UPDATE source_states SET present=0,missing_streak=0 WHERE provider=? AND present=1', (provider,))

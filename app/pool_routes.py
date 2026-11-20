@@ -63,6 +63,16 @@ class Routes:
     def rules(self):
         return json.loads(get_setting('pool_routes') or '{}')
 
+    def covered_by_primary_schedule(self, source, target):
+        source_slot, _, source_provider = source.partition('/')
+        target_slot, _, target_provider = target.partition('/')
+        if source_slot != 'main' or target_slot != 'main':
+            return False
+        rule = main.active_direct_schedule()
+        return bool(rule) and (
+            source_provider, target_provider
+        ) in main.direct.directions(rule['source'], rule['target'])
+
     def command(self, source, target, action):
         endpoints = self.resolve(source, target)
         rules = self.rules()
@@ -75,10 +85,12 @@ class Routes:
         if not main.direct.ENABLED or not all(s.provider_ready(p) for s, p in endpoints):
             raise HTTPException(409, 'Cần bật chuyển nhạc và kết nối cả hai tài khoản.')
         versions = self.versions(endpoints)
-        worker = self.worker(source, target, versions)
         rules[key] = dict(source=source, target=target, versions=versions,
                           scheduled=action=='schedule' or rules.get(key, {}).get('scheduled', False))
         set_setting('pool_routes', json.dumps(rules))
+        if action == 'schedule' and self.covered_by_primary_schedule(source, target):
+            return {'covered_by_primary': True}
+        worker = self.worker(source, target, versions)
         return worker.submit(endpoints[0][1], endpoints[1][1], scheduled=action=='schedule')
 
     async def tick(self):
@@ -87,5 +99,7 @@ class Routes:
             if not all(s.provider_ready(p) for s, p in endpoints) or self.versions(endpoints) != rule['versions']:
                 continue
             worker = self.worker(rule['source'], rule['target'], rule['versions'])
-            if rule['scheduled'] and not worker.running() and (worker.schedule.next_check('direct') or 0)<=time.time():
+            if (rule['scheduled'] and not worker.running()
+                    and not self.covered_by_primary_schedule(rule['source'], rule['target'])
+                    and (worker.schedule.next_check('direct') or 0) <= time.time()):
                 worker.submit(endpoints[0][1], endpoints[1][1], scheduled=True)
