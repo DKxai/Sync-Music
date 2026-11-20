@@ -147,7 +147,7 @@ dialog::backdrop{background:#080a0ed0}
 <a id="ytmusicLink" target="_blank" rel="noopener noreferrer" hidden>Mở Google để nhập mã</a>
 <p id="ytmusicCheckResult" role="status"></p>
 <p id="ytmusicMessage" role="status"></p>
-<p id="ytmusicHelp" class="muted">Để kết nối bằng phiên trình duyệt, tạo tệp bằng <code>ytmusicapi browser</code> rồi đặt tại <code>private/ytmusic_browser.json</code> trên máy chủ.</p>
+<p id="ytmusicHelp" class="muted">Để bật đăng nhập Google, cần đặt YTM_CLIENT_ID và YTM_CLIENT_SECRET của OAuth client loại TVs and Limited Input devices trên máy chủ rồi khởi động lại.</p>
 </article><article class="provider" id="appleCard"><h3>Apple Music</h3><p class="provider-status" id="appleStatus"></p><p class="muted" id="appleCapabilities"></p>
 <button id="appleAuthorize" disabled>Kết nối Apple Music</button>
 <a id="appleLink" target="_blank" rel="noopener noreferrer" hidden>Mở MusicKit để cấp quyền</a>
@@ -223,7 +223,7 @@ async function update(){
   $('baseline').disabled=config.baseline_approved || !accounts.every(account=>account.last_success_at && account.status==='connected');
   $('spotifyAuthorize').disabled=!config.spotify_oauth_configured;
   $('ytmusicCheck').disabled=Boolean(googleGrant) || $('ytmusicCheck').dataset.busy==='true';
-  $('ytmusicAuthorize').hidden=!config.ytmusic_oauth_configured;
+  $('ytmusicAuthorize').hidden=false;
   $('ytmusicAuthorize').disabled=!config.ytmusic_oauth_configured || Boolean(googleGrant);
   $('appleAuthorize').disabled=!config.apple_oauth_configured;
   $('ytmusicHelp').hidden=config.ytmusic_oauth_configured;

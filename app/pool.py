@@ -1,4 +1,5 @@
 """Mount isolated account pairs in one Botkeep process."""
+import json
 import os
 import re
 import sys
@@ -9,8 +10,12 @@ from pathlib import Path
 from types import ModuleType
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends, HTTPException
+from typing import Literal
+from .pool_routes import Routes
+from .pool_ui import panel
 
+from .db import get_setting, set_setting
 from . import main
 from .config import settings
 
@@ -19,9 +24,13 @@ def build():
     slots = list(dict.fromkeys(s.strip() for s in os.getenv("SYNC_PROFILES", "secondary").split(",") if s.strip()))
     if any(not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", s) for s in slots):
         raise ValueError("Invalid SYNC_PROFILES name")
-    mounts = []
-    links = [("/", "Chính")] + [(f"/profiles/{s}/", s) for s in slots]
-    for slug in slots:
+    profiles = {'main': main}
+    routes = Routes(profiles)
+    registry = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    template = main.HTML
+    async def attach(slug, stack):
+        if slug in profiles:
+            return
         prefix = f"/profiles/{slug}"
         # The existing single-account engine owns module-level tasks and OAuth grants.
         # Load one private module namespace per profile so those never cross accounts.
@@ -47,23 +56,82 @@ def build():
             "href=result.connect_url", f"href='{prefix}'+result.connect_url")
         service.apple_authorization.HTML = service.apple_authorization.HTML.replace("fetch('/v1/", f"fetch('{prefix}/v1/")
         service.PROFILE_HOME = prefix + "/"
-        mounts.append((prefix, service))
-    services = [main, *(service for _, service in mounts)]
-    for (url, label), service in zip(links, services):
-        nav = ' · '.join(f'<a href="{path}">{title}</a>' if path != url else f'<strong>{title}</strong>'
-                         for path, title in links)
-        service.HTML = service.HTML.replace('<section id="providers">', f'<nav aria-label="Hồ sơ">Hồ sơ: {nav}</nav><section id="providers">')
+        service.POLL_LOCK = service.direct.POLL_LOCK = main.POLL_LOCK
+        import_module(service.__package__ + '.sync.engine').POLL_LOCK = main.POLL_LOCK
+        service.app.dependency_overrides[service.admin] = main.admin
+        service.PROFILE_HOME = '/'
+        await stack.enter_async_context(service.lifespan(service.app))
+        registry.mount('/' + slug, service.app)
+        profiles[slug] = service
+
+    def render():
+        main.HTML = template.replace('<section id="direct">', panel(profiles) + '<section id="direct">')
 
     @asynccontextmanager
-    async def lifespan(_):
+    async def lifespan(application):
         async with AsyncExitStack() as stack:
-            for service in services:
-                await stack.enter_async_context(service.lifespan(service.app))
-            yield
+            application.state.stack = stack
+            await stack.enter_async_context(main.lifespan(main.app))
+            for slug in dict.fromkeys(slots + json.loads(get_setting('pool_slots') or '[]')):
+                await attach(slug, stack)
+            render()
+            scheduler = main.AsyncIOScheduler(timezone='UTC')
+            scheduler.add_job(routes.tick, 'interval', seconds=30, max_instances=1, coalesce=True)
+            scheduler.start()
+            try:
+                yield
+            finally:
+                scheduler.shutdown(wait=False)
+                for worker in routes.workers.values():
+                    await worker.shutdown()
 
     app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
-    for prefix, service in mounts:
-        app.mount(prefix, service.app)
+    @app.post('/v1/pool/route', dependencies=[Depends(main.admin)])
+    async def route(source: str, target: str, action: Literal['run','schedule','stop']):
+        return routes.command(source, target, action)
+
+    @app.post('/v1/pool/undo', dependencies=[Depends(main.admin)])
+    async def undo_route(source: str, target: str, transfer_id: str):
+        rules = routes.rules()
+        rule = rules.get(source + '>' + target)
+        endpoints = routes.resolve(source, target)
+        if not rule or rule['versions'] != routes.versions(endpoints):
+            raise HTTPException(409, 'Tài khoản đã thay đổi.')
+        worker = routes.worker(source, target, rule['versions'])
+        try:
+            result = worker.submit_undo(transfer_id)
+        except ValueError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        routes.command(source,target,'stop')
+        return result
+
+    @app.get('/v1/pool/routes', dependencies=[Depends(main.admin)])
+    async def route_status():
+        rows = []
+        for rule in routes.rules().values():
+            try:
+                endpoints = routes.resolve(rule['source'], rule['target'])
+                valid = routes.versions(endpoints) == rule['versions']
+                worker = routes.worker(rule['source'], rule['target'], rule['versions']) if valid else None
+                job = worker.status()['job'] if worker else None
+                rows.append(dict(source=rule['source'], target=rule['target'], scheduled=rule['scheduled'],
+                                 state=(job or {}).get('state','idle') if valid else 'account_changed',
+                                 undo=worker.undo.history()[:1] if worker else [],
+                                 error=((job or {}).get('result') or {}).get('error')))
+            except HTTPException:
+                continue
+        return rows
+    @app.post('/v1/pool/accounts', dependencies=[Depends(main.admin)])
+    async def add_slot(name: str):
+        if not re.fullmatch(r'[a-z][a-z0-9-]{0,30}', name) or name in profiles:
+            raise HTTPException(422, 'Tên đã tồn tại hoặc không hợp lệ. Dùng chữ thường, số và dấu gạch ngang.')
+        await attach(name, app.state.stack)
+        saved = json.loads(get_setting('pool_slots') or '[]')
+        set_setting('pool_slots',json.dumps([*saved,name]))
+        render()
+        return {'slot':name}
+
+    app.mount('/profiles', registry)
     app.mount("/", main.app)
     return app
 
