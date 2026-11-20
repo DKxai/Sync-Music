@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import os
+import time
 from datetime import datetime
 
 import httpx
@@ -72,13 +73,79 @@ def export_library(provider):
     else:
         order = 'snapshot_order'
     return LibraryExport(version=1, provider=provider, order=order, tracks=[
-        ExportTrack(source_id=source_id, **{key: data[key] for key in
-                    ('title', 'artist', 'duration_ms', 'isrc', 'added_at') if key in data})
+        _export_track(source_id, data)
         for source_id, data in items
     ])
 
 
+def _export_track(source_id, data):
+    return ExportTrack(source_id=source_id, **{key: data[key] for key in
+                       ('title', 'artist', 'duration_ms', 'isrc', 'added_at') if key in data})
+
+
+def _latest_snapshot(con, provider):
+    row = con.execute(
+        """SELECT s.started_at, s.scope_counts_json FROM snapshot_runs s
+           JOIN accounts a ON a.provider=s.provider
+           WHERE s.provider=? AND s.status='complete' AND a.last_success_at IS NOT NULL
+           ORDER BY s.id DESC LIMIT 1""", (provider,),
+    ).fetchone()
+    if not row:
+        raise TransferError('Hãy nhập thư viện nguồn trước khi chọn nhạc.')
+    return row['started_at'], json.loads(row['scope_counts_json'])
+
+
+def list_collections(provider):
+    with connect() as con:
+        con.execute('BEGIN')
+        started, counts = _latest_snapshot(con, provider)
+        playlists = con.execute(
+            """SELECT remote_id, payload_json FROM source_states WHERE provider=?
+               AND scope='owned_playlist' AND present=1 AND last_seen_at>=?""", (provider, started),
+        )
+        likes = con.execute(
+            'SELECT track_count FROM library_export_snapshots WHERE provider=?', (provider,),
+        ).fetchone()
+        collections = [
+            {'id': row['remote_id'], 'title': json.loads(row['payload_json'])['title'] or 'Playlist chưa có tên',
+             'count': counts['playlist:' + row['remote_id']]}
+            for row in playlists if 'playlist:' + row['remote_id'] in counts
+        ]
+    collections.sort(key=lambda item: (item['title'].casefold(), item['id']))
+    if likes is not None:
+        collections.insert(0, {'id': None, 'title': 'Thư viện Apple Music' if provider == 'apple' else 'Bài đã thích',
+                               'count': likes['track_count']})
+    return {'collections': collections, 'max_tracks': MAX_TRACKS}
+
+
+def export_playlist(provider, playlist_id):
+    scope = 'playlist:' + playlist_id
+    with connect() as con:
+        con.execute('BEGIN')
+        started, counts = _latest_snapshot(con, provider)
+        count = counts.get(scope)
+        if count is None:
+            raise TransferError('Playlist không có trong lượt nhập thư viện mới nhất.')
+        if count > MAX_TRACKS:
+            raise TransferError(f'Mỗi lần chuyển hỗ trợ tối đa {MAX_TRACKS} bài.')
+        rows = con.execute(
+            """SELECT remote_id, payload_json FROM source_states WHERE provider=?
+               AND scope=? AND present=1 AND last_seen_at>=? LIMIT ?""",
+            (provider, scope, started, count + 1),
+        )
+        items = [(row['remote_id'], json.loads(row['payload_json'])) for row in rows]
+    positions = [data.get('position') for _, data in items]
+    if any(type(position) is not int for position in positions) or sorted(positions) != list(range(count)):
+        raise TransferError('Chưa xác minh được thứ tự playlist. Hãy nhập lại thư viện nguồn.')
+    items.sort(key=lambda item: item[1]['position'])
+    return LibraryExport(version=1, provider=provider, order='playlist_order', tracks=[
+        _export_track(data.get('track_id') or occurrence_id, data) for occurrence_id, data in items
+    ])
+
+
 def _match(con, source, target, track):
+    if track.source_id.startswith('unavailable:'):
+        return None, 'unavailable'
     if target == source:
         row = con.execute(
             """SELECT remote_id FROM provider_mappings WHERE provider=?
@@ -104,13 +171,30 @@ def _match(con, source, target, track):
     return (match, 'library_match') if match else (None, 'ambiguous' if reason == 'ambiguous' else 'unmatched')
 
 
+def catalog_match_key(track, auth_revision):
+    evidence = ('v2', track.title, track.artist, track.duration_ms, track.isrc, auth_revision)
+    return hashlib.sha256(json.dumps(evidence, ensure_ascii=False).encode()).hexdigest()
+
+
 def preview(library, target):
     if library.provider not in ('spotify', 'ytmusic', 'apple'):
         raise TransferError('Unknown source provider.')
     with connect() as con:
+        con.execute('BEGIN')
+        auth = con.execute('SELECT value FROM settings WHERE key=?', (target + '_auth_version',)).fetchone()
+        revision = auth['value'] if auth else None
+        now = int(time.time())
         rows = []
         for position, track in enumerate(library.tracks):
             match, method = _match(con, library.provider, target, track)
+            if not match and method != 'unavailable' and library.provider != target:
+                cached = con.execute(
+                    """SELECT target_id FROM direct_catalog_cache WHERE source=? AND source_id=?
+                       AND target=? AND expires_at>? AND match_key=? AND target_id IS NOT NULL""",
+                    (library.provider, track.source_id, target, now, catalog_match_key(track, revision)),
+                ).fetchone()
+                if cached:
+                    match, method = cached['target_id'], 'catalog_cache'
             rows.append({'position': position + 1, **track.model_dump(),
                          'target_id': match, 'match': method})
     plan = hashlib.sha256(json.dumps([target, rows], sort_keys=True).encode()).hexdigest()
@@ -149,23 +233,24 @@ async def execute(library, target, title, expected_plan):
     playlist_id, added = None, 0
     try:
         if target == 'spotify':
-            token = await spotify.access_token()
+            token = await spotify.access_token(required_scopes={'playlist-modify-private'})
             async with httpx.AsyncClient(timeout=20, headers={'Authorization': f'Bearer {token}'}) as api:
-                reply = await api.post(f'{spotify.API}/me/playlists', json={'name': title, 'public': False})
+                reply = await spotify.request(api, 'POST', f'{spotify.API}/me/playlists',
+                                              json={'name': title, 'public': False})
                 reply.raise_for_status()
                 playlist_id = reply.json()['id']
                 _record(key, 'running', playlist_id, added)
                 for offset in range(0, len(ids), 100):
                     batch = ids[offset:offset + 100]
-                    reply = await api.post(f'{spotify.API}/playlists/{playlist_id}/items',
-                                           json={'uris': [f'spotify:track:{value}' for value in batch]})
+                    reply = await spotify.request(api, 'POST', f'{spotify.API}/playlists/{playlist_id}/items',
+                                                  json={'uris': [f'spotify:track:{value}' for value in batch]})
                     reply.raise_for_status()
                     added += len(batch)
                     _record(key, 'running', playlist_id, added)
                 observed = []
                 for offset in range(0, len(ids), 50):
-                    reply = await api.get(f'{spotify.API}/playlists/{playlist_id}/items',
-                                          params={'offset': offset, 'limit': 50})
+                    reply = await spotify.request(api, 'GET', f'{spotify.API}/playlists/{playlist_id}/items',
+                                                  params={'offset': offset, 'limit': 50})
                     reply.raise_for_status()
                     page = reply.json()
                     if page['total'] != len(ids):
@@ -193,7 +278,9 @@ async def execute(library, target, title, expected_plan):
             playlist = await asyncio.to_thread(api.get_playlist, playlist_id, limit=len(ids) + 1)
             if [track.get('videoId') for track in playlist['tracks']] != ids:
                 raise TransferError('YouTube Music did not verify the expected playlist order.')
-    except Exception:
+    except Exception as exc:
+        if target == 'spotify' and isinstance(exc, httpx.HTTPStatusError):
+            spotify.record_rate_limit(exc.response)
         _record(key, 'needs_review', playlist_id, added)
         return {'status': 'needs_review', 'playlist_id': playlist_id, 'added': added}
     _record(key, 'completed', playlist_id, added)

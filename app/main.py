@@ -119,15 +119,19 @@ def poll_minutes():
             'apple': settings.apple_minutes}
 
 
-async def scheduled_checks():
+def active_direct_schedule():
     rule = direct.rule() if direct.ENABLED else None
     if rule and rule['source'] == direct.ALL and not provider_ready('apple'):
         rule = {**rule, 'source': direct.BOTH, 'target': direct.BOTH}
-    ready = direct_schedule_ready(rule)
+    return rule if direct_schedule_ready(rule) else None
+
+
+async def scheduled_checks():
+    rule = active_direct_schedule()
     managed = {provider for pair in direct.directions(rule['source'], rule['target'])
-               for provider in pair} if ready else set()
+               for provider in pair} if rule else set()
     now = time.time()
-    if ready and (schedule.next_check('direct') or 0) <= now:
+    if rule and (schedule.next_check('direct') or 0) <= now:
         direct.submit(rule['source'], rule['target'], scheduled=True)
     for provider in PROVIDERS:
         if provider not in managed and provider_ready(provider) and (schedule.next_check(provider) or 0) <= now:
@@ -209,6 +213,7 @@ def config():
             'max_delete_percent': settings.max_delete_percent,
             'max_delete_absolute': settings.max_delete_absolute,
             'write_enabled': settings.write_enabled, 'baseline_approved': get_setting('baseline_approved') == 'true',
+            'playlist_transfer_enabled': transfer.PLAYLIST_TRANSFER_ENABLED,
             'provider_ready': {provider: provider_ready(provider) for provider in PROVIDERS},
             'spotify_retry_at': spotify.api_retry_at(),
             'spotify_limit_reason': get_setting('spotify_limit_reason'),
@@ -606,15 +611,24 @@ class TransferExecution(TransferPreview):
 
 
 @app.get('/v1/transfers/export/{provider}', dependencies=[Depends(admin)])
-def export_library(provider: Literal['spotify', 'ytmusic', 'apple']):
+def export_library(provider: Literal['spotify', 'ytmusic', 'apple'],
+                   playlist_id: str | None = Query(None, min_length=1, max_length=160)):
     try:
-        library = transfer.export_library(provider)
+        library = transfer.export_playlist(provider, playlist_id) if playlist_id else transfer.export_library(provider)
     except transfer.TransferError as exc:
         raise HTTPException(409, detail=str(exc))
     return JSONResponse(
         library.model_dump(),
         headers={'Cache-Control': 'no-store', 'Content-Disposition': f'attachment; filename="{provider}-library.json"'},
     )
+
+
+@app.get('/v1/transfers/collections/{provider}', dependencies=[Depends(admin)])
+def transfer_collections(provider: Literal['spotify', 'ytmusic', 'apple']):
+    try:
+        return JSONResponse(transfer.list_collections(provider), headers={'Cache-Control': 'no-store'})
+    except transfer.TransferError as exc:
+        raise HTTPException(409, detail=str(exc))
 
 
 @app.post('/v1/transfers/preview', dependencies=[Depends(admin)])
@@ -633,6 +647,12 @@ async def execute_transfer(payload: TransferExecution):
         raise HTTPException(422, detail='Enter a playlist title.')
     if not provider_ready(payload.target):
         raise HTTPException(409, detail='Connect the destination service first.')
+    retry_at = (spotify.api_retry_at if payload.target == 'spotify' else ytmusic.api_retry_at)()
+    if retry_at:
+        return JSONResponse({'detail': 'Dịch vụ đích đang giới hạn yêu cầu.', 'retry_at': retry_at},
+                            status_code=409)
+    if POLL_LOCK.locked():
+        raise HTTPException(409, detail='Máy chủ đang xử lý lượt nhập hoặc đồng bộ khác. Hãy thử lại sau.')
     try:
         async with POLL_LOCK:
             return await transfer.execute(payload.library, payload.target, title, payload.plan)

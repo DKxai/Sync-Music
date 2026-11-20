@@ -33,6 +33,7 @@ class SpotifyDestination:
     def __init__(self, http):
         self.http = http
         self._profile = None
+        self._search_results = {}
 
     async def request(self, method, path, **kwargs):
         result = await spotify.request(self.http, method, f'{spotify.API}{path}', **kwargs)
@@ -56,15 +57,21 @@ class SpotifyDestination:
         return await self._search(query)
 
     async def _search(self, query):
+        if query in self._search_results:
+            return self._search_results[query]
         result = await self.request('GET', '/search', params={'q': query, 'type': 'track', 'limit': 10})
         tracks = spotify.response_object(result, 'tra cứu bài hát').get('tracks')
         if not isinstance(tracks, dict) or not isinstance(tracks.get('items'), list):
             raise ProviderResponseError('Spotify tra cứu bài hát: phản hồi thiếu danh sách kết quả.')
-        return [
+        candidates = [
             (item['id'], item.get('name'), artist_names(item.get('artists')),
              item.get('duration_ms'), (item.get('external_ids') or {}).get('isrc'))
             for item in tracks['items'] if isinstance(item, dict) and item.get('id') and item.get('is_playable') is not False
         ]
+        if len(self._search_results) >= 256:
+            self._search_results.pop(next(iter(self._search_results)))
+        self._search_results[query] = candidates
+        return candidates
 
     async def account(self):
         if self._profile is None:

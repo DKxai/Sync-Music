@@ -1,4 +1,7 @@
 """Responsive admin dashboard for Sync-Music."""
+from . import transfer_ui
+
+
 HTML = r'''<!doctype html><html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Music Sync Hub</title>
 <style>
 :root{color-scheme:dark;--bg:#101216;--panel:#181c24;--surface:#202631;--border:#303848;--ink:#f1f4fa;--muted:#adb8cb;--accent:#a8e8cf;--dark:#142820}
@@ -48,12 +51,17 @@ dialog::backdrop{background:#080a0ed0}
 .workspace-nav{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:18px}
 .workspace-nav a{border:1px solid var(--border);border-radius:24px;padding:8px 15px;text-decoration:none;color:var(--ink)}
 .workspace-nav a:hover{border-color:var(--accent)}
+.active-sync{display:flex;flex-wrap:wrap;gap:6px 18px;align-items:baseline;border:1px solid #806643;
+  border-radius:12px;padding:10px 14px;margin-bottom:16px;background:#29251f}
+.active-sync strong{font-weight:700;color:#ffe0ac}.active-sync a{margin-left:auto}
+.active-sync small{font-variant-numeric:tabular-nums}
 .provider[data-state="error"] .provider-status{color:#ffbfaf}
 .provider-status{border-left:3px solid currentColor;padding-left:10px}
 #serverSummary{display:grid;grid-template-columns:max-content 1fr;gap:8px 18px}
 #serverSummary dd{margin:0}#serverSummary dt{color:var(--muted)}
 [hidden]{display:none!important}
 @media(max-width:760px){.providers-grid{grid-template-columns:1fr}.provider-status{min-height:initial}}
+__TRANSFER_STYLE__
 </style></head>
 <body>
 <header><div class="topbar"><span class="brand"><span class="brand-mark" aria-hidden="true">♫</span>Sync-Music</span><button id="logout" hidden>Đăng xuất</button></div></header>
@@ -67,11 +75,16 @@ dialog::backdrop{background:#080a0ed0}
   <p id="loginMessage" class="muted" role="status"></p>
 </section>
 <div id="workspace" hidden>
-<nav class="workspace-nav" aria-label="Đi tới"><a href="#direct">Đồng bộ</a><a href="#providers">Kết nối dịch vụ</a><a href="#importPanel">Lịch sử nhập</a></nav>
+<nav class="workspace-nav" aria-label="Đi tới"><a href="#transfer">Chuyển nhạc</a><a href="#direct">Đồng bộ tự động</a><a href="#directItemsPanel">Kết quả</a><a href="#providers">Tài khoản</a><a href="#importPanel">Nhập thư viện</a></nav>
 <p id="overviewError" role="status" hidden></p>
+<aside class="active-sync" id="activeSync" hidden aria-label="Đồng bộ đang xử lý">
+  <strong id="activeSyncPhase"></strong><small id="activeSyncRetry"></small><a href="#directJob">Xem tiến độ</a>
+  <a id="spotifyImportLink" href="https://www.spotify.com/import-music/" target="_blank" rel="noopener noreferrer" hidden>Nhập một lần qua Spotify</a>
+</aside>
+__TRANSFER_PANEL__
 <section id="direct">
-  <h1>Đồng bộ thư viện</h1>
-  <p class="muted">Chuyển bài đã thích vào Liked Music hoặc Liked Songs. Bài trong playlist riêng được thêm vào playlist tương ứng.</p>
+  <h2>Đồng bộ thư viện</h2>
+  <p class="muted">Cập nhật bài đã thích và playlist giữa các dịch vụ. Chạy một lượt ngay hoặc bật lịch tự động.</p>
   <label class="choose" for="direction">Hướng đồng bộ
     <select id="direction">
       <option value="ytmusic:spotify">YouTube Music → Spotify</option>
@@ -175,18 +188,6 @@ dialog::backdrop{background:#080a0ed0}
 <div class="flex"><button id="audit">Xem sự kiện và thao tác</button><button id="baseline">Duyệt bản nhập ban đầu</button></div>
 <p id="reviewMessage" role="status"></p><pre id="auditResults"></pre>
 </details>
-<details id="transfer" class="panel">
-<summary>Xuất JSON và nhập playlist thủ công</summary>
-<p><label>Nguồn <select id="transferSource"><option value="ytmusic">YouTube Music Liked Music</option><option value="spotify">Spotify Liked Songs</option><option value="apple">Thư viện Apple Music</option></select></label></p>
-<div class="flex"><button id="transferExport">Tải JSON</button><button id="transferLoad">Lấy dữ liệu nguồn</button></div>
-<p><label>Mở tệp đã xuất <input id="transferFile" type="file" accept=".json,application/json"></label></p>
-<p><label>Đích <select id="transferTarget"><option value="spotify">Spotify</option><option value="ytmusic">YouTube Music</option></select></label></p>
-<button id="transferPreview">Xem trước bản ghép</button>
-<ol id="transferTracks"></ol>
-<p><label>Tên playlist riêng <input id="transferTitle" maxlength="100"></label></p>
-<button id="transferExecute" disabled>Tạo playlist và nhập bài đã ghép</button>
-<p id="transferStatus" role="status"></p>
-</details>
 <details class="panel"><summary>Chi tiết máy chủ</summary><dl id="serverSummary"><dt>Chế độ</dt><dd id="syncMode"></dd><dt>Thư viện gốc</dt><dd id="baselineState"></dd></dl></details>
 </div>
 </main>
@@ -194,9 +195,12 @@ dialog::backdrop{background:#080a0ed0}
 let connected=false, refreshing=false, ruleDirty=false, ruleApplied='', undoRendered='', directBusy=false;
 let googleGrant, googleTimer, checkVersion=0;
 const $=x=>document.getElementById(x);
-document.querySelector('a[href="#importPanel"]').addEventListener('click',()=>{
-  $('importPanel').open=true;
-});
+for(const id of ['directItemsPanel','importPanel']){
+  const openPanel=()=>{if(location.hash==='#'+id)$(id).open=true;};
+  document.querySelector('a[href="#'+id+'"]').addEventListener('click',()=>{$(id).open=true;});
+  window.addEventListener('hashchange',openPanel);
+  openPanel();
+}
 async function request(path,method='GET',body,headers={}) {
   const options={method,headers,cache:'no-store'};
   if (body!==undefined) {
@@ -207,7 +211,8 @@ async function request(path,method='GET',body,headers={}) {
   let payload;try{payload=await r.json()}catch{payload={detail:'Phản hồi không hợp lệ'}}
   if (!r.ok) {
     if (r.status===401 && connected) showSession(false,'Phiên đăng nhập đã hết hạn.');
-    throw new Error(typeof payload.detail==='string'?payload.detail:'HTTP '+r.status);
+    const message=typeof payload.detail==='string'?payload.detail:'HTTP '+r.status;
+    throw new Error(payload.retry_at?message+' Có thể thử lại từ '+retryTime(payload.retry_at)+'.':message);
   }
   return payload;
 }
@@ -218,6 +223,7 @@ async function update(){
   const {accounts,jobs,config,direct}=await request('/v1/overview');
   latestDirect=[direct,config];
   if (!connected) return;
+  syncTransferConfig(config);
   renderDirect(direct,config);
   renderImports(jobs);
   $('baseline').disabled=config.baseline_approved || !accounts.every(account=>account.last_success_at && account.status==='connected');
@@ -305,7 +311,7 @@ $('logout').onclick=async()=>{
 const names={spotify:'Spotify',ytmusic:'YouTube Music',apple:'Apple Music'};
 const syncLabel=(source,target)=>source==='both' ? 'Spotify ↔ YouTube Music'
   : source==='all' ? 'Spotify ↔ YouTube Music + nguồn Apple Music' : names[source]+' → '+names[target];
-const stages={waiting:'Đang chờ',check_permissions:'Đang kiểm tra quyền ghi',read_source:'Đang đọc thư viện nguồn',read_destination:'Đang đọc thư viện đích',
+const stages={waiting:'Đang chờ lượt xử lý',check_permissions:'Đang kiểm tra quyền ghi',read_source:'Đang đọc thư viện nguồn',read_destination:'Đang đọc thư viện đích',
   match_tracks:'Đang ghép bài hát', write_collections:'Đang cập nhật lượt thích và playlist',undo:'Đang hoàn tác'};
 const states={idle:'Chưa chạy',queued:'Đang chờ',running:'Đang nhập',completed:'Hoàn tất',failed:'Gặp lỗi',
   interrupted:'Bị gián đoạn',partial:'Hoàn tất một phần'};
@@ -335,6 +341,7 @@ function renderDirect(data,config) {
   const [source,target]=$('direction').value.split(':');
   const ready=directionReady(config,source,target);
   const busy=job?.state==='queued'||job?.state==='running';
+  $('activeSync').hidden=!busy;
   $('runDirect').disabled=!enabled || !ready || busy || directBusy;
   $('saveSchedule').disabled=!enabled || busy || directBusy || (!ready && $('schedule').checked);
   $('schedule').disabled=!enabled || busy || directBusy;
@@ -344,11 +351,14 @@ function renderDirect(data,config) {
       +(next_check_at && !busy?' · Kiểm tra lại lúc '+retryTime(next_check_at):'') : '';
   $('directJob').hidden=!job;
   if(job){
+    const usesSpotify=job.source==='spotify'||job.target==='spotify'||['both','all'].includes(job.source);
+    const retryAt=job.retry_at || (job.state==='queued' && usesSpotify ? config.spotify_retry_at : null);
     const waiting=job.retry_provider||'spotify';
-    const phase=busy && job.retry_at ? 'Đang chờ '+names[waiting]
-      +(waiting==='spotify'&&config.spotify_limit_reason==='quota'?' do hết quota':'')
+    const phase=busy && retryAt ? 'Đang chờ '+names[waiting]
+      +(waiting==='spotify'&&config.spotify_limit_reason==='quota'?' vì hết hạn mức API':' giới hạn yêu cầu')
       : job.stage==='no_changes' ? 'Thư viện không đổi' : busy ? stages[job.stage] : states[job.state];
-    const step=job.stage==='match_tracks'?'match':job.stage==='write_collections'?'write':'read';
+    const step=job.stage==='match_tracks'?'match':job.stage==='write_collections'?'write':
+      ['read_source','read_destination'].includes(job.stage)?'read':null;
     $('progressSteps').hidden=!busy || job.stage==='undo';
     $('progressSteps').querySelectorAll('li').forEach(li=>{
       if(li.dataset.step===step)li.setAttribute('aria-current','step');else li.removeAttribute('aria-current');
@@ -358,8 +368,8 @@ function renderDirect(data,config) {
     const text=(phase||states[job.state])+' · '+direction
       +(busy&&job.total?' · '+job.done+'/'+job.total:'');
     if ($('directPhase').textContent!==text) $('directPhase').textContent=text;
-    $('directProgress').hidden=['failed','interrupted'].includes(job.state);
-    showProgress($('directProgress'),job.done,job.total || (busy?0:1));
+    $('directProgress').hidden=['failed','interrupted','queued'].includes(job.state) || Boolean(retryAt && busy);
+    showProgress($('directProgress'),job.total ? job.done : Number(!busy),job.total || (busy?0:1));
     const r=job.result;
     const pieces=job.stage.startsWith('undo')
       ? [count(r.likes_removed,'lượt thích đã gỡ'),count(r.playlist_tracks_removed,'mục playlist đã gỡ'),
@@ -368,7 +378,13 @@ function renderDirect(data,config) {
          ...(!busy ? [count(r.unmatched,'mục chưa ghép'),count(r.tracks_failed,'mục gặp lỗi'),
            count(r.search_deferred,'mục chờ tra cứu'),count(r.writes_deferred,'mục chờ ghi lượt sau'),
            count(r.playlists_need_review,'playlist cần kiểm tra')] : [])];
-    const retry=busy && job.retry_at ? 'Tự tiếp tục từ '+retryTime(job.retry_at) : '';
+    const retry=busy && retryAt ? 'Tự tiếp tục từ '+retryTime(retryAt) : '';
+    if(busy){
+      if($('activeSyncPhase').textContent!==text)$('activeSyncPhase').textContent=text;
+      $('activeSyncRetry').textContent=retry;
+      $('activeSyncRetry').hidden=!retry;
+      $('spotifyImportLink').hidden=!retry || waiting!=='spotify';
+    }
     const error=r.error && stages[job.stage] ? `${stages[job.stage]} · ${r.error}` : r.error;
     $('directResult').textContent=[error,...pieces,
       r.apple_error?'Apple Music · '+r.apple_error:'',
@@ -754,86 +770,7 @@ $('baseline').addEventListener('click',async()=>{
     await update();
   } catch(e) { $('reviewMessage').textContent=e.message; }
 });
-let transferLibrary, transferPlan;
-const transferStatus = message => { $('transferStatus').textContent=message; };
-function resetTransferPreview() {
-  transferPlan=undefined;
-  $('transferTracks').replaceChildren();
-  $('transferExecute').disabled=true;
-}
-const loadTransferSource=()=>request('/v1/transfers/export/'+$('transferSource').value);
-$('transferSource').onchange=()=>{transferLibrary=undefined;resetTransferPreview();};
-$('transferTarget').onchange=resetTransferPreview;
-$('transferLoad').onclick=async()=>{
-  resetTransferPreview();
-  transferLibrary=undefined;
-  const source=$('transferSource').value;
-  try {
-    const library=await loadTransferSource();
-    if (source!==$('transferSource').value) return;
-    transferLibrary=library;
-    transferStatus('Đã đọc '+library.tracks.length+' bài.');
-  } catch(e) { transferStatus(e.message); }
-};
-$('transferExport').onclick=async()=>{
-  try {
-    const data=await loadTransferSource();
-    const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:'application/json'}));
-    const link=document.createElement('a');
-    link.href=url;
-    link.download=data.provider+'-library.json';
-    link.click();
-    setTimeout(()=>URL.revokeObjectURL(url),1000);
-  } catch(e) { transferStatus(e.message); }
-};
-$('transferFile').onchange=async()=>{
-  resetTransferPreview();
-  transferLibrary=undefined;
-  const file=$('transferFile').files[0];
-  if (!file) return;
-  try {
-    if (file.size>3000000) throw new Error('Tệp vượt quá 3 MB.');
-    const data=JSON.parse(await file.text());
-    if (file!==$('transferFile').files[0]) return;
-    if (data.version!==1 || !Array.isArray(data.tracks)) throw new Error('Định dạng tệp xuất không hợp lệ.');
-    transferLibrary=data;
-    transferStatus('Đã mở tệp có '+data.tracks.length+' bài.');
-  } catch(e) { transferStatus(e.message); }
-};
-$('transferPreview').onclick=async()=>{
-  resetTransferPreview();
-  const library=transferLibrary, target=$('transferTarget').value;
-  try {
-    if (!library) throw new Error('Hãy lấy dữ liệu nguồn hoặc mở tệp xuất trước.');
-    const plan=await request('/v1/transfers/preview','POST',{library,target});
-    if (library!==transferLibrary || target!==$('transferTarget').value) return;
-    transferPlan=plan;
-    for (const track of plan.tracks) {
-      const item=document.createElement('li');
-      item.textContent=[track.title,track.artist,track.target_id ? 'đã ghép ('+track.match+')' : 'chưa ghép'].filter(Boolean).join(' · ');
-      $('transferTracks').append(item);
-    }
-    transferStatus('Đã ghép '+plan.matched+'/'+plan.total+' bài.');
-    $('transferExecute').disabled=!plan.matched;
-  } catch(e) { transferStatus(e.message); }
-};
-$('transferExecute').onclick=async()=>{
-  const title=$('transferTitle').value.trim();
-  if (!title || !transferPlan) {
-    transferStatus('Nhập tên playlist sau khi xem trước.');
-    return;
-  }
-  const payload={library:transferLibrary,target:$('transferTarget').value,title,plan:transferPlan.plan};
-  $('transferExecute').disabled=true;
-  try {
-    const result=await request('/v1/transfers/execute','POST',payload);
-    transferStatus('Kết quả '+result.status+' · '+result.added+' bài'
-      +(result.playlist_id ? ' · ID playlist '+result.playlist_id : ''));
-  } catch(e) {
-    transferStatus(e.message);
-    if (transferPlan?.plan===payload.plan) $('transferExecute').disabled=false;
-  }
-};
+__TRANSFER_SCRIPT__
 document.querySelectorAll('button[data-provider]').forEach(b=>b.addEventListener('click',async()=>{if(!connected)return;$('message').textContent='Đang xếp hàng: '+b.dataset.provider;try{await request('/v1/sync/'+b.dataset.provider,'POST');$('message').textContent='Yêu cầu đã vào hàng đợi.';await update()}catch(e){$('message').textContent='Lỗi: '+e.message}}));
 async function restoreSession(){
   try {await request('/v1/config');showSession(true);await update();}
@@ -852,3 +789,7 @@ async function refreshVisible(){
 document.addEventListener('visibilitychange',()=>void refreshVisible());
 void refreshVisible();
 </script></body></html>'''
+
+HTML = (HTML.replace('__TRANSFER_STYLE__', transfer_ui.STYLE)
+        .replace('__TRANSFER_PANEL__', transfer_ui.PANEL)
+        .replace('__TRANSFER_SCRIPT__', transfer_ui.SCRIPT))

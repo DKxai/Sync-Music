@@ -65,7 +65,7 @@ def build():
         profiles[slug] = service
 
     def render():
-        main.HTML = template.replace('<section id="direct">', panel(profiles) + '<section id="direct">')
+        main.HTML = template.replace('<section id="providers">', panel(profiles) + '<section id="providers">')
 
     @asynccontextmanager
     async def lifespan(application):
@@ -115,7 +115,13 @@ def build():
                 worker = routes.worker(rule['source'], rule['target'], rule['versions']) if valid else None
                 job = worker.status()['job'] if worker else None
                 rows.append(dict(source=rule['source'], target=rule['target'], scheduled=rule['scheduled'],
+                                 covered_by_primary=rule['scheduled'] and valid and
+                                 routes.covered_by_primary_schedule(rule['source'], rule['target']),
                                  state=(job or {}).get('state','idle') if valid else 'account_changed',
+                                 stage=job['stage'] if job else None,
+                                 done=job['done'] if job else 0, total=job['total'] if job else 0,
+                                 retry_at=job['retry_at'] if job else None,
+                                 retry_provider=job['retry_provider'] if job else None,
                                  undo=worker.undo.history()[:1] if worker else [],
                                  error=((job or {}).get('result') or {}).get('error')))
             except HTTPException:
