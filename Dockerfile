@@ -7,4 +7,4 @@ COPY app ./app
 COPY db ./db
 USER app
 EXPOSE 8787
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8787", "--workers", "1"]
+CMD ["uvicorn", "app.pool:app", "--host", "0.0.0.0", "--port", "8787", "--workers", "1"]
