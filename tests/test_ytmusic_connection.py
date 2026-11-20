@@ -159,5 +159,19 @@ def test_rejected_unexpired_session_renews_once(monkeypatch):
     reads = Mock(side_effect=[ytmusic.SessionRejected('signed out'), ['song']])
     monkeypatch.setattr(ytmusic, 'liked_tracks', reads)
     assert ytmusic.read_session() == (new, ['song'])
-    clients.assert_called_with(rejected_access_token='rejected')
+    clients.assert_called_with(rejected_access_token='rejected', mode='oauth')
     assert clients.call_count == 2
+
+
+def test_browser_switch_requires_matching_channel(monkeypatch, tmp_path):
+    path = tmp_path / 'ytmusic_browser.json'
+    path.write_text('{}')
+    monkeypatch.setattr(ytmusic, 'settings', replace(ytmusic.settings, ytm_auth_path=path))
+    monkeypatch.setattr(ytmusic, 'has_token', lambda _: True)
+    monkeypatch.setattr(ytmusic, 'client', lambda *, mode: mode)
+    monkeypatch.setattr(ytmusic, 'liked_tracks', lambda *_args, **_kw: [])
+    monkeypatch.setattr(ytmusic, 'destination_account', lambda mode: '@' + mode)
+    with pytest.raises(ytmusic.NotConfigured, match='kênh khác'):
+        ytmusic.validate_mode('browser')
+    monkeypatch.setattr(ytmusic, 'destination_account', lambda _: '@correct')
+    assert ytmusic.validate_mode('browser') == ytmusic.sha256(b'{}').hexdigest()

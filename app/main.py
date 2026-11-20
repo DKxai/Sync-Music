@@ -136,7 +136,10 @@ async def scheduled_checks():
 
 def provider_ready(provider: str) -> bool:
     if provider == 'ytmusic':
-        return settings.ytm_auth_path.is_file() or (google_oauth.configured() and has_token('ytmusic'))
+        mode = ytmusic.auth_mode()
+        browser = mode != 'oauth' and settings.ytm_auth_path.is_file()
+        oauth = mode != 'browser' and google_oauth.configured() and has_token('ytmusic')
+        return browser or oauth
     if provider == 'apple':
         if not apple.developer_configured():
             return False
@@ -213,6 +216,8 @@ def config():
             'next_checks': {name: schedule.next_check(name) for name in (*PROVIDERS, 'direct')},
             'spotify_redirect_uri': settings.spotify_redirect_uri,
             'ytmusic_oauth_configured': google_oauth.configured(),
+            'ytmusic_auth_mode': ytmusic.auth_mode(),
+            'ytmusic_browser_available': settings.ytm_auth_path.is_file(),
             'apple_favorites_configured': bool(settings.apple_favorites_playlist_id),
             'apple_oauth_configured': apple_authorization.configured(),
             'spotify_oauth_configured': bool(settings.spotify_client_id and settings.spotify_redirect_uri)}
@@ -446,6 +451,7 @@ async def disconnect(provider: Literal['spotify', 'ytmusic']):
             if provider == 'ytmusic':
                 settings.ytm_auth_path.unlink(missing_ok=True)
                 google_oauth.cancel()
+                con.execute("DELETE FROM settings WHERE key IN ('ytmusic_auth_mode','ytmusic_browser_fingerprint')")
             else:
                 con.execute("DELETE FROM oauth_states WHERE state NOT LIKE 'apple-%'")
             con.execute('DELETE FROM encrypted_tokens WHERE provider=?', (provider,))
@@ -467,6 +473,35 @@ async def ytmusic_check():
                             headers={'Retry-After': str(max(1, int(exc.retry_at - time.time()) + 1))}) from None
     except ProviderResponseError as exc:
         raise HTTPException(502, detail=str(exc)) from None
+
+
+class YouTubeAuthMode(BaseModel):
+    mode: Literal['browser', 'oauth']
+
+
+@app.put('/v1/auth/ytmusic/mode', dependencies=[Depends(admin)])
+async def ytmusic_mode(payload: YouTubeAuthMode):
+    if POLL_LOCK.locked() or direct.running() or _active:
+        raise HTTPException(409, 'Chờ lượt đang chạy kết thúc trước khi đổi cách kết nối.')
+    async with POLL_LOCK:
+        try:
+            fingerprint = await asyncio.to_thread(ytmusic.validate_mode, payload.mode)
+        except NotConfigured as exc:
+            raise HTTPException(409, str(exc)) from None
+        except ytmusic.RateLimited as exc:
+            raise HTTPException(429, 'YouTube Music đang giới hạn yêu cầu.',
+                                headers={'Retry-After': str(max(1, int(exc.retry_at - time.time()) + 1))}) from None
+        except ProviderResponseError as exc:
+            raise HTTPException(502, str(exc)) from None
+        with connect() as con:
+            con.execute("INSERT OR REPLACE INTO settings(key,value) VALUES ('ytmusic_auth_mode',?)", (payload.mode,))
+            con.execute("DELETE FROM settings WHERE key='ytmusic_browser_fingerprint'")
+            if fingerprint:
+                con.execute("INSERT INTO settings(key,value) VALUES ('ytmusic_browser_fingerprint',?)", (fingerprint,))
+            invalidate_account(con, 'ytmusic')
+            con.execute('UPDATE direct_sync_rule SET scheduled=0')
+    submit('ytmusic', 'auth_mode')
+    return {'mode': payload.mode}
 
 
 @app.post('/v1/auth/ytmusic/start', dependencies=[Depends(admin)])

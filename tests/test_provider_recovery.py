@@ -124,12 +124,12 @@ def test_browser_file_with_missing_origin_and_authorization(tmp_path, monkeypatc
     monkeypatch.setattr(ytmusic, 'settings', replace(ytmusic.settings, ytm_client_id='', ytm_auth_path=path))
     path.write_text(json.dumps({'Cookie': '__Secure-3PAPISID=fixture',
                                 'X-Goog-Visitor-Id': 'fixture', 'X-Goog-AuthUser': '0'}))
-    api = ytmusic.client()
+    api = ytmusic.client(mode='browser')
     assert api.auth_type == AuthType.BROWSER
     assert api.origin == 'https://music.youtube.com'
     path.write_text('{"Cookie":"invalid=private-value"}')
     with pytest.raises(ytmusic.NotConfigured, match='không hợp lệ') as error:
-        ytmusic.client()
+        ytmusic.client(mode='browser')
     assert 'private-value' not in str(error.value)
 
 
