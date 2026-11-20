@@ -112,3 +112,8 @@ async def poll(handle: str) -> dict:
         save_token('ytmusic', data, reconnect=True)
         _grant = None
         return {'status': 'connected'}
+
+
+def cancel():
+    global _grant
+    _grant = None

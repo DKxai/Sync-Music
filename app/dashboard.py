@@ -137,11 +137,13 @@ dialog::backdrop{background:#080a0ed0}
 <h3>Spotify</h3><p class="provider-status" id="spotifyStatus"></p>
 <p id="spotifyRedirect" hidden>Redirect URI trong Spotify Developer Dashboard <code id="spotifyUri"></code></p>
 <button id="spotifyAuthorize" disabled>Kết nối Spotify</button>
+<button id="spotifyDisconnect">Gỡ kết nối</button>
 <a id="spotifyLink" href="#" target="_blank" rel="noopener noreferrer" hidden>Mở Spotify để cấp quyền</a>
 <p id="spotifyMessage" role="status"></p>
 </article><article class="provider" id="ytmusicCard"><h3>YouTube Music</h3><p class="provider-status" id="ytmusicStatus"></p>
 <button id="ytmusicCheck">Kiểm tra kết nối</button>
 <button id="ytmusicAuthorize" disabled>Kết nối YouTube Music</button>
+<button id="ytmusicDisconnect">Gỡ kết nối</button>
 <a id="ytmusicLink" target="_blank" rel="noopener noreferrer" hidden>Mở Google để nhập mã</a>
 <p id="ytmusicCheckResult" role="status"></p>
 <p id="ytmusicMessage" role="status"></p>
@@ -639,6 +641,18 @@ $('spotifyAuthorize').addEventListener('click',async()=>{
     $('spotifyLink').focus();
   } catch(e) { $('spotifyMessage').textContent='Lỗi: '+e.message; }
 });
+for (const provider of ['spotify','ytmusic']) {
+  $(provider+'Disconnect').onclick=async()=>{
+    if (!confirm('Gỡ kết nối trong hồ sơ này và tắt lịch đồng bộ? Với YouTube Music, tệp phiên của hồ sơ cũng sẽ bị xóa.')) return;
+    try {
+      await request('/v1/auth/'+provider+'/connection','DELETE');
+      if(provider==='ytmusic'){clearTimeout(googleTimer);googleGrant=undefined;}
+      $(provider+'Link').hidden=true;
+      $(provider+'Message').textContent='Đã gỡ kết nối.';
+      await update();
+    } catch(e){$(provider+'Message').textContent=e.message;}
+  };
+}
 $('spotifyLink').addEventListener('click',()=>{$('spotifyLink').hidden=true});
 $('appleAuthorize').addEventListener('click',async()=>{
   $('appleLink').hidden=true;

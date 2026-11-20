@@ -14,7 +14,7 @@ def test_botkeep_entrypoint(monkeypatch, tmp_path):
     runpy.run_path(str(ROOT / "main.py"), run_name="__main__")
     assert len(calls) == 1
     args, kw = calls[0]
-    assert args == ("app.main:app",)
+    assert args == ("app.pool:app",)
     assert kw["port"] == 4567
     assert kw["host"] == "0.0.0.0"
     assert kw["workers"] == 1

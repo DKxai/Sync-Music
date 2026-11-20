@@ -20,10 +20,11 @@ from .connectors import apple, google_oauth, requests_log, spotify, ytmusic
 from .connectors.base import Item, NotConfigured, ProviderResponseError
 from .dashboard import HTML
 from .dashboard_session import admin, router as dashboard_session_router
-from .provider_tokens import has_token
+from .provider_tokens import has_token, invalidate_account
 from .sync.engine import POLL_LOCK, _canonical, poll
 from .sync import direct, direct_results, review, schedule, transfer, writer
 
+PROFILE_HOME = '/'
 PROVIDERS = ('spotify', 'ytmusic', 'apple')
 _jobs: dict[str, dict] = {}
 _active: dict[str, str] = {}
@@ -419,7 +420,7 @@ async def spotify_callback(code: str | None = None, state: str | None = None, er
         '<!doctype html><html lang="vi"><meta charset="utf-8"><title>Spotify đã kết nối</title>'
         '<h1>Đã cấp quyền Spotify</h1><p>Máy chủ đang xử lý lượt nhập thư viện. '
         'Nếu Spotify giới hạn yêu cầu, lượt nhập sẽ tự tiếp tục sau thời gian chờ.</p>'
-        '<a href="/">Về dashboard</a></html>',
+        f'<a href="{PROFILE_HOME}">Về dashboard</a></html>',
         headers={'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer'},
     )
 
@@ -434,6 +435,25 @@ class GooglePoll(BaseModel):
 class AppleGrant(BaseModel):
     state: str = Field(min_length=16, max_length=80)
     user_token: str = Field(min_length=16, max_length=8192)
+
+
+@app.delete('/v1/auth/{provider}/connection', dependencies=[Depends(admin)])
+async def disconnect(provider: Literal['spotify', 'ytmusic']):
+    if POLL_LOCK.locked() or direct.running() or _active:
+        raise HTTPException(409, 'Chờ lượt đang chạy kết thúc trước khi gỡ kết nối.')
+    async with POLL_LOCK:
+        with connect() as con:
+            if provider == 'ytmusic':
+                settings.ytm_auth_path.unlink(missing_ok=True)
+                google_oauth.cancel()
+            else:
+                con.execute("DELETE FROM oauth_states WHERE state NOT LIKE 'apple-%'")
+            con.execute('DELETE FROM encrypted_tokens WHERE provider=?', (provider,))
+            invalidate_account(con, provider)
+            con.execute("UPDATE accounts SET status='disconnected' WHERE provider=?", (provider,))
+            con.execute('UPDATE direct_sync_rule SET scheduled=0')
+            con.execute('DELETE FROM direct_playlist_links WHERE source=? OR target=?', (provider, provider))
+    return {'disconnected': True}
 
 
 @app.post('/v1/auth/ytmusic/check', dependencies=[Depends(admin)])

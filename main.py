@@ -21,6 +21,6 @@ if __name__ == "__main__":
     if not 1 <= port <= 65535:
         raise ValueError("SERVER_PORT must be in 1..65535")
     uvicorn.run(
-        "app.main:app", host="0.0.0.0", port=port,
+        "app.pool:app", host="0.0.0.0", port=port,
         workers=1, access_log=False, log_level="warning"
     )
